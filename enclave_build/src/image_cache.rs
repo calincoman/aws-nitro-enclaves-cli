@@ -3,6 +3,7 @@
 
 use std::convert::TryInto;
 use std::fs::File;
+use std::fs::create_dir_all;
 use std::path::Path;
 use std::env;
 use std::fs;
@@ -254,7 +255,7 @@ impl CacheLogic {
     /// Find and retrieve a cached image as a file if available in the local cache
     pub fn get_cached_image(image_ref: &Reference, cache_manager: &CacheManager) -> Result<File, CacheError> {
         // Get the image file path
-        let image_file_path = match CachePath::get_image_path(image_ref, cache_manager) {
+        let image_file_path = match CachePath::get_image_folder_path(image_ref, cache_manager) {
             Ok(aux) => aux,
             Err(err) => {
                 return Err(CacheError::FindImageError(format!("Cached image path could not be computed: {:?}", err)));
@@ -289,16 +290,29 @@ pub struct CachePath {}
 
 impl CachePath {
 
-    /// Returns the root folder path of the cache
+    /// Returns the root folder of the cache
+    /// 
+    /// For CACHE_ROOT_FOLDER = XDG_DATA_DIRS
+    // pub fn get_cache_root_folder() -> String {
+    //     let aux = env::var_os(CACHE_ROOT_FOLDER).unwrap();
+    //     let xdg_data_dirs = aux.to_str().unwrap();
+    //     let dirs: Vec<&str> = xdg_data_dirs.split(":").collect();
+
+    //     // For CACHE_ROOT_FOLDER = XDG_DATA_DIRS, choose to take the first directory path
+    //     // PROBLEM - on the EC2 AL2 instance XDG_DATA_DIRS is not set from what I have seen
+    //     // => should have some default root folder for this case
+    //     dirs[0].to_string()
+    // }
+
+    /// Returns the root folder of the cache
+    /// 
+    /// For CACHE_ROOT_FOLDER = HOME
+    /// Used just for testing
     pub fn get_cache_root_folder() -> String {
         let aux = env::var_os(CACHE_ROOT_FOLDER).unwrap();
-        let xdg_data_dirs = aux.to_str().unwrap();
-        let dirs: Vec<&str> = xdg_data_dirs.split(":").collect();
+        let home = aux.to_str().unwrap();
 
-        // For CACHE_ROOT_FOLDER = XDG_DATA_DIRS, choose to take the first directory path
-        // PROBLEM - on the EC2 AL2 instance XDG_DATA_DIRS is not set from what I have seen
-        // => should have some default root folder for this case
-        dirs[0].to_string()
+        home.to_string()
     }
 
     /// Returns the path to the root folder of the cache
@@ -310,7 +324,7 @@ impl CachePath {
 
     /// Returns the path to the cache root folder of an image
     /// e.g. {ROOT}/.nitro_cli/container_cache/{IMAGE_HASH}
-    pub fn get_image_path(image_ref: &Reference, cache_manager: &CacheManager) -> Result<String, CacheError> {
+    pub fn get_image_folder_path(image_ref: &Reference, cache_manager: &CacheManager) -> Result<String, CacheError> {
         let image_hash = cache_manager.get_image_hash(&image_ref.whole());
         match image_hash {
             Ok(_) => (),
@@ -320,5 +334,16 @@ impl CachePath {
         };
 
         Ok(format!("{}{}", CachePath::get_root_path(), image_hash.unwrap()))
+    }
+
+    /// Creates the folder path of the cache
+    /// 
+    /// e.g. if path is '{ROOT}/.nitro_cli/container_cache/', it creates each folder from the path
+    pub fn create_cache_root_path(path: &String) -> Result<(), CacheError> {
+        match create_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(CacheError::CacheCreationError(format!(
+                "Failed to create cache folder structure: {:?}", err)))
+        }
     }
 }

@@ -8,6 +8,7 @@ use std::io::Read;
 use oci_distribution::Reference;
 use oci_distribution::client::ImageData;
 
+use crate::constants::CACHE_INDEX_FILE_NAME;
 use crate::utils::{ExtractLogic, Image};
 
 #[derive(Debug, PartialEq)]
@@ -16,6 +17,7 @@ pub enum CacheError {
     ImageFileError(String),
     DataCacheError(String),
     ArgumentError(String),
+    WriteError(String),
 
     CacheCreationError(String),
     UriNotFoundError(String),
@@ -48,10 +50,7 @@ impl CacheManager {
 
     /// Return the image hash corresponding to the image URI if available, or else return an error
     pub fn get_image_hash(&self, uri: &String) -> Result<String, CacheError> {
-        let image_hash: Option<&String> = match self.values.get(uri) {
-            Some(img_hash) => Some(img_hash),
-            None => None,
-        };
+        let image_hash: Option<&String> = self.values.get(uri);
 
         match image_hash {
             Some(hash) => Ok(hash.to_string()),
@@ -107,6 +106,29 @@ impl CacheManager {
         self.values = map;
 
         Ok(())
+    }
+
+    /// Writes the content of the hashmap ((image URI <-> image hash) mappings) to the index.json file
+    /// in the specified path
+    pub fn write_json_file(&self, path: &String) -> Result<(), CacheError> {
+        let mut new_path = path.clone();
+        new_path.push_str(CACHE_INDEX_FILE_NAME);
+
+        // Create (or open if it's already created) the index.json file
+        let index_file = match File::create(new_path) {
+            Ok(aux) => aux,
+            Err(err) => {
+                return Err(CacheError::CacheCreationError(format!(
+                    "The cache index file could not be created: {:?}", err)));
+            }
+        };
+
+        // Write the hashmap (the mappings) to the file
+        match serde_json::to_writer_pretty(index_file, &self.values) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(CacheError::WriteError(format!(
+                "Failed to write hashmap to index file: {:?}", err)))
+        }
     }
 
 }
