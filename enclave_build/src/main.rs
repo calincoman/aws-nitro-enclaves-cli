@@ -12,6 +12,7 @@ mod image_cache;
 mod docker;
 mod constants;
 mod cache_manager;
+mod image_pull;
 
 fn main() {
     let matches = App::new("Docker2Eif builder")
