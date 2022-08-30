@@ -661,30 +661,34 @@ mod tests {
     }
 
     pub fn docker_auth(image_name: &String) -> Result<RegistryAuth, TestError> {
-        println!("First you must provide docker credentials.");
-        let auth = read_credentials();
-        // let auth = get_docker_auth(image_name)
-        //     .map_err(|err| err)?;
-    
-        match auth {
-            RegistryAuth::Anonymous => panic!("Authentication requires both a username and a password"),
-            RegistryAuth::Basic(_, _) => ()
-        }
-    
-        println!("");
+        println!("First you should provide docker credentials.");
+
+        let mut credential_file_path = std::env::current_dir().unwrap();
+        // Just for testing
+        credential_file_path.push("credentials.txt");
+
+        let auth = match File::open(&credential_file_path) {
+            Ok(_) => {
+                println!("Credentials found.");
+                read_credentials(&credential_file_path)
+            },
+            Err(err) => {
+                println!("No credential file supplied, performing anonymous pull: {:?}", err);
+                RegistryAuth::Anonymous
+            }
+        };
     
         Ok(auth)
     }
 
     /// FOR TESTING
-    /// Reads docker registry credentials from the credentials.txt file stored in the enclave_build crate
+    /// Reads docker registry credentials from the file path given as parameter
     ///
     /// In that file, the DockerHub username should be on the first line and the password on the second
     /// 
-    /// Credentials are used for pulling the image from the remote registry
-    pub fn read_credentials() -> RegistryAuth {
-
-        let mut file = File::open("credentials.txt")
+    /// Credentials are used for pulling the image from the remote registry, but are not mandatory
+    pub fn read_credentials<P: AsRef<Path>>(path: P) -> RegistryAuth {
+        let mut file = File::open(path)
             .expect("File not found - a 'credentials.txt' file with the docker registry credentials should be\
                             in the local directory");
 
