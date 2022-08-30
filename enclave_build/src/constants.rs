@@ -17,7 +17,7 @@ pub const HOME_ENV_VAR: &str = "HOME";
 pub const CACHE_LAYERS_FOLDER_NAME: &str = "layers";
 
 /// The name of the actual image file from the image cache folder
-pub const IMAGE_FILE_NAME: &str = "image_file";
+pub const CACHE_IMAGE_FILE_NAME: &str = "image_file";
 
 /// The name of the iamge config file from the cache
 pub const CACHE_CONFIG_FILE_NAME: &str = "config.json";
