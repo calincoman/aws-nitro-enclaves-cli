@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use oci_distribution::{Reference};
-use oci_distribution::client::{ImageData, ImageLayer};
+use oci_distribution::client::{Client, ClientProtocol, ImageData, ImageLayer};
 use oci_distribution::ParseError;
 
-use crate::cache_manager::{self, CacheManager};
+use crate::cache_manager::{self, CacheManager, Image};
 use crate::extract::{self, ExtractError};
 use crate::constants::{self, CACHE_CONFIG_FILE_NAME, CACHE_MANIFEST_FILE_NAME};
 
@@ -61,59 +61,6 @@ impl fmt::Display for GlobalError {
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 pub type FetchResult<T> = std::result::Result<T, FetchError>;
 
-/// Wrapper struct which represents an image
-/// 
-/// Fields:
-/// - reference: The image URI (Reference struct is from https://github.com/krustlet/oci-distribution library)
-/// 
-/// - data: ImageData struct from https://github.com/krustlet/oci-distribution
-pub struct Image {
-    reference: Reference,
-    data: ImageData
-}
-
-impl Image {
-    pub fn new(reference: Reference, data: ImageData) -> Image {
-        Self { reference, data }
-    }
-
-    pub fn reference(&self) -> &Reference {
-        &self.reference
-    }
-
-    pub fn data(&self) -> &ImageData {
-        &self.data
-    }
-
-    /// Builds a docker image reference from the image name given as parameter
-    pub fn build_image_reference(image_name: &str) -> Result<Reference, ParseError> {
-        let image_ref = image_name.parse().map_err(|err| {
-            eprintln!("Failed to build image reference from image name.");
-            ParseError::TagInvalidFormat
-        })?;
-
-        Ok(image_ref)
-    }
-
-    pub fn get_image_name_from_ref(image_ref: &Reference) -> String {
-        image_ref.repository().split('/').collect::<Vec<&str>>().get(1).unwrap().to_string()
-    }
-
-    /// Returns the digest hash of an image by looking first in the cache,
-    /// then trying to extract it from the struct
-    pub fn get_image_hash(&self, cache_manager: &CacheManager) -> Result<String, ExtractError> {
-        // Try to get the hash from the cache by looking up the image reference
-        match cache_manager.get_image_hash(&self.reference.whole()) {
-            Some(hash) => Ok(hash),
-            // If not found in the cache, extract the image hash from the struct
-            None => match extract::extract_image_hash(&self.data) {
-                Ok(hash) => Ok(hash),
-                Err(err) => Err(ExtractError::ImageHashError(format!("{:?}", err)))
-            }
-        }.map_err(|err| ExtractError::ImageHashError(format!("{:?}", err)))
-    }
-}
-
 /// Trait for the cache store operation
 /// 
 /// Provides the 'store' method to be implemented
@@ -149,7 +96,7 @@ impl ImageContents {
     }
 
     pub fn from_image(image: &Image) -> Result<Self, GlobalError> {
-        let image_contents = extract::extract_image(&image.data)
+        let image_contents = extract::extract_image(image.data())
             .map_err(|err| GlobalError::ConvertError(err.to_string()))?;
         
         Ok(ImageContents(image_contents))
@@ -169,7 +116,7 @@ impl ImageLayers {
     }
 
     pub fn from_image(image: &Image) -> Result<Self, GlobalError> {
-        let image_layers = extract::extract_layers(&image.data)
+        let image_layers = extract::extract_layers(image.data())
             .map_err(|err| GlobalError::ConvertError(err.to_string()))?;
 
         Ok(ImageLayers(image_layers))
@@ -189,7 +136,7 @@ impl ImageConfig {
     }
 
     pub fn from_image(image: &Image) -> Result<Self, GlobalError> {
-        let image_config = extract::extract_config_json(&image.data)
+        let image_config = extract::extract_config_json(image.data())
             .map_err(|err| GlobalError::ConvertError(err.to_string()))?;
 
         Ok(ImageConfig(image_config))
@@ -209,7 +156,7 @@ impl ImageManifest {
     }
 
     pub fn from_image(image: &Image) -> Result<Self, GlobalError> {
-        let image_manifest = extract::extract_manifest_json(&image.data)
+        let image_manifest = extract::extract_manifest_json(image.data())
             .map_err(|err| GlobalError::ConvertError(err.to_string()))?;
 
         Ok(ImageManifest(image_manifest))
@@ -229,7 +176,7 @@ impl EnvExpressions {
     }
 
     pub fn from_image(image: &Image) -> Result<Self, GlobalError> {
-        let env_expressions = extract::extract_env_expressions(&image.data)
+        let env_expressions = extract::extract_env_expressions(image.data())
             .map_err(|err| GlobalError::ConvertError(err.to_string()))?;
 
         Ok(EnvExpressions(env_expressions))
@@ -249,7 +196,7 @@ impl CmdExpressions {
     }
 
     pub fn from_image(image: &Image) -> Result<Self, GlobalError> {
-        let cmd_expressions = extract::extract_cmd_expressions(&image.data)
+        let cmd_expressions = extract::extract_cmd_expressions(image.data())
             .map_err(|err| GlobalError::ConvertError(err.to_string()))?;
 
         Ok(CmdExpressions(cmd_expressions))
@@ -559,11 +506,78 @@ impl CacheFetch<Vec<String>> for CmdExpressions {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum TestError {
-    ImageCacheError(String),
-    ImagePullError(String),
-    CredentialsError(String),
+/// Caches the image at the path provided in the CacheManager given as argument
+/// 
+/// The cache root folder path should already be created
+/// 
+/// This function creates the cache image folder, stores the contents and updates the cache index.json
+pub fn cache_image(cache_manager: &mut CacheManager, image: &Image) -> StoreResult<()> {
+    // Check if the image is already cached
+    if cache_manager.is_cached(&image.reference().whole()) {
+        eprintln!("Image with URI {} is already cached", image.reference().whole());
+        return Ok(())
+    }
+
+    // Determine the path of the folder where the image data will be stored
+    let image_folder_path = CacheManager::get_custom_image_folder_path(image, cache_manager.cache_path())
+        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+
+    // Create the folder where the image data will be stored
+    CacheManager::create_image_folder(image, cache_manager.cache_path())
+        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+
+    // Store the image data in the cache
+    let _ = _store_image_data(&image, image_folder_path)
+        .map_err(|err| err);
+
+    // Add the image to the CacheManager's HashMap
+    cache_manager.record_image(image)
+        .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
+
+    // Serialize the CacheManager's hashmap to the index.json file
+    cache_manager.write_index_file()
+        .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
+
+    Ok(())
+}
+
+// Stores the image data in the cache at the path provided as parameter
+fn _store_image_data<P: AsRef<Path>>(image: &Image, path: P) -> StoreResult<()> {
+    let image_contents = ImageContents::from_image(&image)
+        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+
+    let image_layers = ImageLayers::from_image(&image)
+        .map_err(|err| StoreError::ImageLayersError(format!("{:?}", err)))?;
+
+    let image_config = ImageConfig::from_image(&image)
+        .map_err(|err| StoreError::ConfigError(format!("{:?}", err)))?;
+
+    let image_manifest = ImageManifest::from_image(&image)
+        .map_err(|err| StoreError::ManifestError(format!("{:?}", err)))?;
+
+    let env = EnvExpressions::from_image(&image)
+        .map_err(|err| StoreError::EnvCmdError(format!("{:?}", err)))?;
+
+    let cmd = CmdExpressions::from_image(&image)
+        .map_err(|err| StoreError::EnvCmdError(format!("{:?}", err)))?;
+
+    image_contents.store(&path).map_err(|err| err)?;
+    image_layers.store(&path).map_err(|err| err)?;
+    image_config.store(&path).map_err(|err| err)?;
+    image_manifest.store(&path).map_err(|err| err)?;
+    env.store(&path).map_err(|err| err)?;
+    cmd.store(&path).map_err(|err| err)?;
+
+    Ok(())
+}
+
+/// Builds a client which uses the protocol given as parameter
+pub fn build_client(protocol: ClientProtocol) -> Client {
+    let client_config = oci_distribution::client::ClientConfig {
+        protocol,
+        ..Default::default()
+    };
+    Client::new(client_config)
 }
 
 /// This mod pulls an image from the docker registry and tests that the cache store / fetch works
@@ -572,6 +586,13 @@ pub enum TestError {
 mod tests {
     use super::*;
     use oci_distribution::secrets::RegistryAuth;
+
+    #[derive(Debug, PartialEq)]
+    pub enum TestError {
+        ImageCacheError(String),
+        ImagePullError(String),
+        CredentialsError(String),
+    }
 
     const TEST_IMAGE_NAME: &str = "hello-world";
 
@@ -590,7 +611,7 @@ mod tests {
             .map_err(|err| err)?;
 
         // Get the root folder of the cache
-        let cache_folder_path = CacheManager::get_default_cache_root_folder().map_err(|err|
+        let cache_folder_path = CacheManager::get_default_cache_root_path().map_err(|err|
             TestError::ImageCacheError(format!("{:?}", err)))?;
 
         // Create the folders from the path
@@ -607,7 +628,7 @@ mod tests {
 
         let image = Image::new(image_ref.clone(), image_data.clone());
         
-        cache_manager::cache_image(&mut cache_manager, &image)
+        cache_image(&mut cache_manager, &image)
             .map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         Ok(())
@@ -620,7 +641,7 @@ mod tests {
         let image_ref = Image::build_image_reference(&image_name)
             .expect("Failed to build image reference from image name.");
 
-        let cache_folder_path = CacheManager::get_default_cache_root_folder().unwrap();
+        let cache_folder_path = CacheManager::get_default_cache_root_path().unwrap();
         CacheManager::create_cache_folder_path(&cache_folder_path).unwrap();
 
         // Download the image data from the remote registry
@@ -643,9 +664,11 @@ mod tests {
                 oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
             ];
 
-        let mut client = cache_manager::build_client(oci_distribution::client::ClientProtocol::Https);
+        let mut client = build_client(oci_distribution::client::ClientProtocol::Https);
+
         let image_ref = Image::build_image_reference(image_name)
             .expect("Failed to build image reference from image name.");
+
         let auth = docker_auth(&TEST_IMAGE_NAME.to_string())
             .map_err(|err| err)?;
         
@@ -701,105 +724,6 @@ mod tests {
             return RegistryAuth::Anonymous;
         }
         RegistryAuth::Basic(words[0].to_string(), words[1].to_string())
-    }
-
-    pub fn get_docker_auth(image_name: &String) -> Result<RegistryAuth, TestError> {
-        let image = image_name.clone();
-        let host = if let Ok(uri) = url::Url::parse(&image) {
-            uri.host().map(|s| s.to_string())
-        } else {
-            // Some Docker URIs don't have the protocol included, so just use
-            // a dummy one to trick Url that it's a properly defined Uri.
-            let uri = format!("dummy://{}", image);
-            if let Ok(uri) = url::Url::parse(&uri) {
-                uri.host().map(|s| s.to_string())
-            } else {
-                None
-            }
-        };
-
-        match host.clone() {
-            Some(val) => println!("{}", val),
-            None => println!("No host found.") 
-        };
-
-        if let Some(registry_domain) = host {
-            let config_file = get_config_file()?;
-
-            let config_json: serde_json::Value = serde_json::from_reader(&config_file)
-                .map_err(|err| TestError::CredentialsError(format!("JSON was not well-formatted: {}", err)))?;
-
-            let auths = config_json.get("auths").ok_or_else(|| {
-                TestError::CredentialsError("Could not find auths key in config JSON".to_string())
-            })?;
-
-            if let serde_json::Value::Object(auths) = auths {
-                for (registry_name, registry_auths) in auths.iter() {
-                    if !registry_name.to_string().contains(&registry_domain) {
-                        continue;
-                    }
-
-                    let auth = registry_auths
-                        .get("auth")
-                        .ok_or_else(|| {
-                            TestError::CredentialsError("Could not find auth key in config JSON".to_string())
-                        })?
-                        .to_string();
-
-                    let auth = auth.replace(r#"""#, "");
-                    let decoded = base64::decode(&auth).map_err(|err| {
-                        TestError::CredentialsError(format!("Invalid Base64 encoding for auth: {}", err))
-                    })?;
-                    let decoded = std::str::from_utf8(&decoded).map_err(|err| {
-                        TestError::CredentialsError(format!("Invalid utf8 encoding for auth: {}", err))
-                    })?;
-
-                    if let Some(index) = decoded.rfind(':') {
-                        let (user, after_user) = decoded.split_at(index);
-                        let (_, password) = after_user.split_at(1);
-
-                        return Ok(RegistryAuth::Basic(user.to_string(), password.to_string()));
-                    }
-                }
-            }
-        }
-
-        Err(TestError::CredentialsError(
-            "No credentials found for the current image".to_string(),
-        ))
-    }
-
-    fn get_config_file() -> Result<File, TestError> {
-        if let Ok(file) = std::env::var("DOCKER_CONFIG") {
-            let config_file = File::open(file).map_err(|err| {
-                TestError::CredentialsError(format!(
-                    "Could not open file pointed by env\
-                     DOCKER_CONFIG: {}",
-                    err
-                ))
-            })?;
-            Ok(config_file)
-        } else {
-            if let Ok(home_dir) = std::env::var("HOME") {
-                let default_config_path = format!("{}/.docker/config.json", home_dir);
-                let config_path = Path::new(&default_config_path);
-                if config_path.exists() {
-                    let config_file = File::open(config_path).map_err(|err| {
-                        TestError::CredentialsError(format!(
-                            "Could not open file {:?}: {}",
-                            config_path.to_str(),
-                            err
-                        ))
-                    })?;
-                    return Ok(config_file);
-                }
-            }
-            Err(TestError::CredentialsError(
-                "Config file not present, please set env \
-                 DOCKER_CONFIG accordingly"
-                    .to_string(),
-            ))
-        }
     }
 
     #[tokio::test]
