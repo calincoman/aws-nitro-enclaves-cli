@@ -8,43 +8,100 @@ use std::path::{PathBuf, Path};
 use std::fs;
 use std::env;
 
+use oci_distribution::{Reference, client::ImageData};
+
 use crate::constants;
-use crate::extract;
-use crate::cache::{
-    Image,
-    CacheManagerError,
-    StoreResult,
-    StoreError,
+use crate::extract::{self, ExtractError};
 
-    ImageContents,
-    ImageLayers,
-    ImageConfig,
-    ImageManifest,
-    EnvExpressions,
-    CmdExpressions,
-
-    CacheStore,
-};
-
-use oci_distribution::client::{Client, ClientProtocol, ClientConfig};
-
-/// Builds a client which uses the protocol given as parameter
-/// Client required for the https://github.com/krustlet/oci-distribution library API
-pub fn build_client(protocol: ClientProtocol) -> Client {
-    let client_config = ClientConfig {
-        protocol,
-        ..Default::default()
-    };
-    Client::new(client_config)
+#[derive(Debug, PartialEq)]
+pub enum CacheManagerError {
+    PathError(String),
+    StoreError(String),
+    RetrieveError(String),
+    GetImageHashError(String)
 }
 
-/// Keeps a record of images stored in the cache and handles the index.json file parsing
+/// Wrapper struct which represents an image
+/// 
+/// Fields:
+/// - reference: The image URI (Reference struct is from https://github.com/krustlet/oci-distribution library)
+/// 
+/// - data: ImageData struct from https://github.com/krustlet/oci-distribution
+pub struct Image {
+    reference: Reference,
+    data: ImageData
+}
+
+impl Image {
+    pub fn new(reference: Reference, data: ImageData) -> Image {
+        Self { reference, data }
+    }
+
+    pub fn reference(&self) -> &Reference {
+        &self.reference
+    }
+
+    pub fn data(&self) -> &ImageData {
+        &self.data
+    }
+
+    /// Builds a docker image reference from the image name given as parameter
+    /// 
+    /// e.g. "hello-world" image has reference "docker.io/library/hello-world:latest"
+    pub fn build_image_reference(image_name: &str) -> Result<Reference, oci_distribution::ParseError> {
+        let image_ref = image_name.parse().map_err(|err| {
+            eprintln!("Failed to build image reference from image name.");
+            oci_distribution::ParseError::ReferenceInvalidFormat
+        })?;
+
+        Ok(image_ref)
+    }
+
+    /// Calculates the image name (without tag) from the reference
+    pub fn get_image_name_from_ref(image_ref: &Reference) -> String {
+        image_ref.repository().split('/').collect::<Vec<&str>>().get(1).unwrap().to_string()
+    }
+
+    /// Returns the digest hash of an image by looking first in the cache,
+    /// then trying to extract it from the Image struct
+    pub fn get_image_hash(&self, cache_manager: &CacheManager) -> Result<String, ExtractError> {
+        // Try to get the hash from the cache by looking up the image reference
+        match cache_manager.get_image_hash(&self.reference.whole()) {
+            Some(hash) => Ok(hash),
+            // If not found in the cache, extract the image hash from the struct
+            None => match extract::extract_image_hash(&self.data) {
+                Ok(hash) => Ok(hash),
+                Err(err) => Err(ExtractError::ImageHashError(Some(err.to_string())))
+            }
+        }.map_err(|err| ExtractError::ImageHashError(Some(err.to_string())))
+    }
+}
+
+/// Keeps a record of images stored in the cache and updates the index.json file
 /// 
 /// Also contains logic for creating the cache folders
+/// 
+/// The index.json file is located in the cache root and keeps track of images stored in cache
+/// 
+/// The cache structure is:
+/// 
+/// {CACHE_ROOT_PATH}/index.json\
+/// {CACHE_ROOT_PATH}/image_cache_folder1\
+/// {CACHE_ROOT_PATH}/image_cache_folder2\
+/// etc.
+/// 
+/// An image cache folder contains:
+/// 
+/// {IMAGE_FOLDER_PATH}/config.json\
+/// {IMAGE_FOLDER_PATH}/manifest.json\
+/// {IMAGE_FOLDER_PATH}/layers - folder containing all layers, each in a separate gzip compressed file\
+/// {IMAGE_FOLDER_PATH}/image_file - gzip compressed file containing all layers combined, as an array of bytes\
+/// {IMAGE_FOLDER_PATH}/env.sh - contains ENV expressions of the image\
+/// {IMAGE_FOLDER_PATH}/cmd.sh - contains CMD expressions of the image
 pub struct CacheManager {
-    // Represents the folder path used as cache
+    /// Represents the root path used as cache (the path at which the index.json file is stored)
     cache_path: PathBuf,
-    // Stores the (image URI <-> image hash) mappings from the index.json of the cache
+    /// Stores the (image URI <-> image hash) mappings from the index.json of the cache
     values: HashMap<String, String>,
 }
 
@@ -106,7 +163,8 @@ impl CacheManager {
         self.values.insert(uri.to_string(), hash.to_string());
     }
 
-    /// Creates the cache index.json file, if not already created.
+    /// Creates the cache index.json file, if not already created
+    /// 
     /// The file is created at the location specified by the 'cache_path' field of the current
     /// CacheManager object
     ///
@@ -129,8 +187,7 @@ impl CacheManager {
         };
     }
 
-    /// Populate the CacheManager's hashmap with the values from the index.json file which contains the mappings
-    /// The path given should be a folder containing an index.json file
+    /// Populate the CacheManager's hashmap with the values from the index.json file which contains the mappings.
     ///
     /// Returns a CacheManager object with the hashmap updated
     /// 
@@ -141,8 +198,8 @@ impl CacheManager {
 
         // Open the JSON file
         let index_file = File::open(index_file_path);
-        let mut json_file = index_file.map_err(|err| CacheManagerError::RetrieveError(format!(
-            "Failed to open the index.json file: {:?}", err)))?;
+        let mut json_file = index_file.map_err(|err|
+            CacheManagerError::RetrieveError(format!("Failed to open the index.json file: {:?}", err)))?;
 
         // Read the JSON string from the file
         let mut json_string = String::new();
@@ -166,7 +223,7 @@ impl CacheManager {
     }
 
     /// Writes the content of the hashmap ((image URI <-> image hash) mappings) to the index.json file
-    /// in the cache path provided in the struct
+    /// in the cache path provided in the CacheManager
     ///
     /// The already existing content of the file is overwritten
     pub fn write_index_file(&self) -> Result<(), CacheManagerError> {
@@ -188,7 +245,7 @@ impl CacheManager {
     /// 
     /// If the TEST_MODE_ENABLED constant is set to true, ./test_cache/container_cache
     /// is used as cache root
-    pub fn get_default_cache_root_folder() -> Result<PathBuf, CacheManagerError> {
+    pub fn get_default_cache_root_path() -> Result<PathBuf, CacheManagerError> {
         // For testing, the cache will be saved to the local directory
         if constants::TEST_MODE_ENABLED {
             let mut local_path = std::env::current_dir().unwrap();
@@ -197,12 +254,12 @@ impl CacheManager {
             return Ok(local_path);
         }
 
-        // Use XDG_DATA_HOME as default root
+        // Try to use XDG_DATA_HOME as default root
         let root = match env::var_os(constants::CACHE_ROOT_FOLDER) {
             Some(val) => val.into_string()
                 .map_err(|err| CacheManagerError::PathError(format!(
                     "Failed to determine the cache root folder: {:?}", err)))?,
-            // If XDG_DATA_HOME is not set, use $HOME/.local/share as specified in
+            // If XDG_DATA_HOME is not set, use {HOME}/.local/share as specified in
             // https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
             None => {
                 let home_folder = env::var_os("HOME")
@@ -214,6 +271,7 @@ impl CacheManager {
         };
 
         let mut path = PathBuf::from(root);
+        // Add the additional path to the root
         path.push(".nitro_cli/container_cache");
 
         Ok(path)
@@ -229,7 +287,7 @@ impl CacheManager {
             CacheManagerError::PathError(format!("Failed to determine the image folder path: {:?}", err)))?;
 
         // Get the cache root folder
-        let mut cache_root = Self::get_default_cache_root_folder()
+        let mut cache_root = Self::get_default_cache_root_path()
             .map_err(|err| CacheManagerError::PathError(format!(
                 "Failed to determine the image folder path: {:?}", err)))?;
 
@@ -238,10 +296,11 @@ impl CacheManager {
         Ok(cache_root)
     }
 
-    /// Determines the path of the image cache folder considering the cache as the path
+    /// Determines the path of the image cache folder considering the cache root as the path
     /// given as parameter
     pub fn get_custom_image_folder_path(image: &Image, cache_path: &PathBuf) -> Result<PathBuf, CacheManagerError> {
         let mut image_folder_path = cache_path.clone();
+
         // Build the image folder path by appending the image hash at the end of the provided path
         image_folder_path.push(extract::extract_image_hash(&image.data())
             .map_err(|err| CacheManagerError::PathError(format!(
@@ -268,69 +327,4 @@ impl CacheManager {
         fs::create_dir_all(image_folder_path).map_err(|err|
             CacheManagerError::PathError(format!("Failed to create the image cache folder: {:?}", err)))
     }
-}
-
-/// Caches the image at the path provided in the CacheManager given as argument
-/// 
-/// The cache root folder path should already be created
-/// 
-/// This function creates the cache image folder, stores the contents and updates the cache index.json
-pub fn cache_image(cache_manager: &mut CacheManager, image: &Image) -> StoreResult<()> {
-    // Check if the image is already cached
-    if cache_manager.is_cached(&image.reference().whole()) {
-        eprintln!("Image with URI {} is already cached", image.reference().whole());
-        return Ok(())
-    }
-
-    // Determine the path of the folder where the image data will be stored
-    let image_folder_path = CacheManager::get_custom_image_folder_path(image, cache_manager.cache_path())
-        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
-
-    // Create the folder where the image data will be stored
-    CacheManager::create_image_folder(image, cache_manager.cache_path())
-        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
-
-    // Store the image data in the cache
-    let _ = _store_image_data(&image, image_folder_path)
-        .map_err(|err| err);
-
-    // Add the image to the CacheManager's HashMap
-    cache_manager.record_image(image)
-        .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
-
-    // Serialize the CacheManager's hashmap to the index.json file
-    cache_manager.write_index_file()
-        .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
-
-    Ok(())
-}
-
-// Stores the image data in the cache at the path provided as parameter
-fn _store_image_data<P: AsRef<Path>>(image: &Image, path: P) -> StoreResult<()> {
-    let image_contents = ImageContents::from_image(&image)
-        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
-
-    let image_layers = ImageLayers::from_image(&image)
-        .map_err(|err| StoreError::ImageLayersError(format!("{:?}", err)))?;
-
-    let image_config = ImageConfig::from_image(&image)
-        .map_err(|err| StoreError::ConfigError(format!("{:?}", err)))?;
-
-    let image_manifest = ImageManifest::from_image(&image)
-        .map_err(|err| StoreError::ManifestError(format!("{:?}", err)))?;
-
-    let env = EnvExpressions::from_image(&image)
-        .map_err(|err| StoreError::EnvCmdError(format!("{:?}", err)))?;
-
-    let cmd = CmdExpressions::from_image(&image)
-        .map_err(|err| StoreError::EnvCmdError(format!("{:?}", err)))?;
-
-    image_contents.store(&path).map_err(|err| err)?;
-    image_layers.store(&path).map_err(|err| err)?;
-    image_config.store(&path).map_err(|err| err)?;
-    image_manifest.store(&path).map_err(|err| err)?;
-    env.store(&path).map_err(|err| err)?;
-    cmd.store(&path).map_err(|err| err)?;
-
-    Ok(())
 }
