@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use oci_distribution::{Reference};
-use oci_distribution::client::{Client, ClientProtocol, ImageData, ImageLayer};
+use oci_distribution::client::{ImageData, ImageLayer, Client, ClientProtocol};
 use oci_distribution::ParseError;
 
 use crate::cache_manager::{self, CacheManager, Image};
@@ -36,7 +36,7 @@ pub enum StoreError {
     ManifestError(String),
     LayerError(String),
     EnvCmdError(String),
-    IndexJsonError(String),
+    IndexJsonError(String)
 }
 
 #[derive(Debug, PartialEq)]
@@ -60,6 +60,15 @@ impl fmt::Display for GlobalError {
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 pub type FetchResult<T> = std::result::Result<T, FetchError>;
+
+/// Builds a client which uses the protocol given as parameter
+pub fn build_client(protocol: ClientProtocol) -> Client {
+    let client_config = oci_distribution::client::ClientConfig {
+        protocol,
+        ..Default::default()
+    };
+    Client::new(client_config)
+}
 
 /// Trait for the cache store operation
 /// 
@@ -506,81 +515,32 @@ impl CacheFetch<Vec<String>> for CmdExpressions {
     }
 }
 
-/// Caches the image at the path provided in the CacheManager given as argument
-/// 
-/// The cache root folder path should already be created
-/// 
-/// This function creates the cache image folder, stores the contents and updates the cache index.json
-pub fn cache_image(cache_manager: &mut CacheManager, image: &Image) -> StoreResult<()> {
-    // Check if the image is already cached
-    if cache_manager.is_cached(&image.reference().whole()) {
-        eprintln!("Image with URI {} is already cached", image.reference().whole());
-        return Ok(())
-    }
-
-    // Determine the path of the folder where the image data will be stored
-    let image_folder_path = CacheManager::get_custom_image_folder_path(image, cache_manager.cache_path())
-        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
-
-    // Create the folder where the image data will be stored
-    CacheManager::create_image_folder(image, cache_manager.cache_path())
-        .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
-
-    // Store the image data in the cache
-    let _ = _store_image_data(&image, image_folder_path)
-        .map_err(|err| err);
-
-    // Add the image to the CacheManager's HashMap
-    cache_manager.record_image(image)
-        .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
-
-    // Serialize the CacheManager's hashmap to the index.json file
-    cache_manager.write_index_file()
-        .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
-
-    Ok(())
-}
-
 // Stores the image data in the cache at the path provided as parameter
-fn _store_image_data<P: AsRef<Path>>(image: &Image, path: P) -> StoreResult<()> {
+pub fn store_image_data<P: AsRef<Path>>(image: &Image, path: P) -> StoreResult<()> {
     let image_contents = ImageContents::from_image(&image)
         .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
-
     let image_layers = ImageLayers::from_image(&image)
         .map_err(|err| StoreError::ImageLayersError(format!("{:?}", err)))?;
-
     let image_config = ImageConfig::from_image(&image)
         .map_err(|err| StoreError::ConfigError(format!("{:?}", err)))?;
-
     let image_manifest = ImageManifest::from_image(&image)
         .map_err(|err| StoreError::ManifestError(format!("{:?}", err)))?;
-
     let env = EnvExpressions::from_image(&image)
         .map_err(|err| StoreError::EnvCmdError(format!("{:?}", err)))?;
-
     let cmd = CmdExpressions::from_image(&image)
         .map_err(|err| StoreError::EnvCmdError(format!("{:?}", err)))?;
 
-    image_contents.store(&path).map_err(|err| err)?;
-    image_layers.store(&path).map_err(|err| err)?;
-    image_config.store(&path).map_err(|err| err)?;
-    image_manifest.store(&path).map_err(|err| err)?;
-    env.store(&path).map_err(|err| err)?;
-    cmd.store(&path).map_err(|err| err)?;
+    image_contents.store(&path)?;
+    image_layers.store(&path)?;
+    image_config.store(&path)?;
+    image_manifest.store(&path)?;
+    env.store(&path)?;
+    cmd.store(&path)?;
 
     Ok(())
 }
 
-/// Builds a client which uses the protocol given as parameter
-pub fn build_client(protocol: ClientProtocol) -> Client {
-    let client_config = oci_distribution::client::ClientConfig {
-        protocol,
-        ..Default::default()
-    };
-    Client::new(client_config)
-}
-
-/// This mod pulls an image from the docker registry and tests that the cache store / fetch works
+/// This module pulls an image from the docker registry and tests that the cache store / fetch works
 /// THE SETUP_CACHE FUNCTION SHOULD BE RUN FIRST TO PULL AND STORE THE IMAGE
 #[cfg(test)]
 mod tests {
@@ -591,47 +551,22 @@ mod tests {
     pub enum TestError {
         ImageCacheError(String),
         ImagePullError(String),
-        CredentialsError(String),
     }
 
+    /// Name of the image to be pulled and cached
     const TEST_IMAGE_NAME: &str = "hello-world";
 
-    /// This should be run first to pull the image and store it to the cache so the other tests do not fail
-    /// 
-    /// The function pulls the TEST_IMAGE_NAME image
-    #[tokio::test]
-    async fn setup_test_cache() -> Result<(), TestError> {
-        // Name of the image to be used for testing
-        let image_name = TEST_IMAGE_NAME.to_string();
-        let image_ref = Image::build_image_reference(&image_name)
-            .expect("Failed to build image reference");  
-
-        // Pull the image data from the remote registry
-        let image_data = get_image_data(&image_name).await
-            .map_err(|err| err)?;
-
+    pub fn create_test_cache_manager() -> CacheManager {
         // Get the root folder of the cache
-        let cache_folder_path = CacheManager::get_default_cache_root_path().map_err(|err|
-            TestError::ImageCacheError(format!("{:?}", err)))?;
-
-        // Create the folders from the path
-        CacheManager::create_cache_folder_path(&cache_folder_path).map_err(|err|
-            TestError::ImageCacheError(format!("{:?}", err)))?;
+        let cache_folder_path = CacheManager::get_default_cache_root_path()
+            .expect("get cache root path");
 
         // Create the CacheManager
-        let mut cache_manager = CacheManager::new(&cache_folder_path)
-            .create_index_file()
-                .map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?
-            .populate_hashmap()
-                .map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+        let cache_manager = CacheManager::new(&cache_folder_path)
+            .create_index_file().expect("create cache manager")
+            .populate_hashmap().expect("create cache manager");
 
-
-        let image = Image::new(image_ref.clone(), image_data.clone());
-        
-        cache_image(&mut cache_manager, &image)
-            .map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
-
-        Ok(())
+        cache_manager
     }
 
     /// Used for setting up a test
@@ -641,99 +576,91 @@ mod tests {
         let image_ref = Image::build_image_reference(&image_name)
             .expect("Failed to build image reference from image name.");
 
-        let cache_folder_path = CacheManager::get_default_cache_root_path().unwrap();
-        CacheManager::create_cache_folder_path(&cache_folder_path).unwrap();
+        let cache_manager = create_test_cache_manager();
 
         // Download the image data from the remote registry
-        let image_data = get_image_data(&image_name).await.unwrap();
-
-        // Create the cache manager for testing
-        let cache_manager = CacheManager::new(&cache_folder_path)
-            .create_index_file().unwrap()
-            .populate_hashmap().unwrap();
+        let image_data = crate::pull::pull_image_data(&image_name)
+            .await
+            .expect("pull image");
 
         (Image::new(image_ref.clone(), image_data.clone()), cache_manager)
     }
 
-    // Pulls an ImageData struct from the Docker remote registry
-    // For testing purposes
-    pub async fn get_image_data(image_name: &String) -> Result<ImageData, TestError> {
-        let accepted_media_types =
-            vec![
-                oci_distribution::manifest::WASM_LAYER_MEDIA_TYPE,
-                oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
-            ];
-
-        let mut client = build_client(oci_distribution::client::ClientProtocol::Https);
-
-        let image_ref = Image::build_image_reference(image_name)
-            .expect("Failed to build image reference from image name.");
-
-        let auth = docker_auth(&TEST_IMAGE_NAME.to_string())
-            .map_err(|err| err)?;
-        
-        let image_data = client
-            .pull(&image_ref, &auth, accepted_media_types)
-            .await;
-        
-        match image_data {
-            Ok(img_data) => Ok(img_data),
-            Err(err) => Err(TestError::ImagePullError(format!(
-                "Could not pull the image data from the remote registry: {:?}", err)))
-        }
-    }
-
-    pub fn docker_auth(image_name: &String) -> Result<RegistryAuth, TestError> {
-        println!("First you should provide docker credentials.");
-
-        let mut credential_file_path = std::env::current_dir().unwrap();
-        // Just for testing
-        credential_file_path.push("credentials.txt");
-
-        let auth = match File::open(&credential_file_path) {
-            Ok(_) => {
-                println!("Credentials found.");
-                read_credentials(&credential_file_path)
-            },
-            Err(err) => {
-                println!("No credential file supplied, performing anonymous pull: {:?}", err);
-                RegistryAuth::Anonymous
-            }
-        };
-    
-        Ok(auth)
-    }
-
-    /// FOR TESTING
-    /// Reads docker registry credentials from the file path given as parameter
-    ///
-    /// In that file, the DockerHub username should be on the first line and the password on the second
+    /// This should be run first to pull the image and store it to the cache so the other tests do not fail
     /// 
-    /// Credentials are used for pulling the image from the remote registry, but are not mandatory
-    pub fn read_credentials<P: AsRef<Path>>(path: P) -> RegistryAuth {
-        let mut file = File::open(path)
-            .expect("File not found - a 'credentials.txt' file with the docker registry credentials should be\
-                            in the local directory");
+    /// The function pulls the TEST_IMAGE_NAME image
+    #[tokio::test]
+    async fn setup_test_cache() -> Result<(), TestError> {
+        // Name of the image to be used for testing
+        let image_name = TEST_IMAGE_NAME.to_string();
 
-        let mut data = String::new();
-        file.read_to_string(&mut data)
-            .expect("Error while reading file");
+        let mut cache_manager = create_test_cache_manager();
 
-        let words: Vec<&str> = data.split("\n").collect();
-        if words.len() < 2 || words[0].len() == 0 || words[1].len() == 0 {
-            return RegistryAuth::Anonymous;
-        }
-        RegistryAuth::Basic(words[0].to_string(), words[1].to_string())
+        cache_manager.create_cache_folders();
+        
+        cache_manager.cache_image(&image_name)
+            .await
+            .map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_validate_manifest() {
+        // Get the root folder of the cache
+        let cache_folder_path = CacheManager::get_default_cache_root_path()
+            .expect("get cache root path");
+
+        // Create the CacheManager
+        let mut cache_manager = CacheManager::new(&cache_folder_path)
+            .create_index_file().expect("create cache manager")
+            .populate_hashmap().expect("create cache manager");
+
+        let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
+
+        let image_ref = Image::build_image_reference(&TEST_IMAGE_NAME.to_string())
+            .expect("get image reference");
+
+        let (pulled_manifest, _) = crate::pull::pull_manifest(&image_ref)
+            .await
+            .expect("pull manifest");
+        let pulled_manifest_str = serde_json::to_string(&pulled_manifest)
+            .expect("serialize manifest");
+
+        let val = cache_manager.validate_manifest(
+            &test_image_digest,
+            &pulled_manifest_str
+        );
+            
+        assert_eq!(val.is_err(), false);
+    }
+
+    #[test]
+    fn test_validate_config() {
+        // Get the root folder of the cache
+        let cache_folder_path = CacheManager::get_default_cache_root_path()
+            .expect("get cache root path");
+
+        // Create the CacheManager
+        let cache_manager = CacheManager::new(&cache_folder_path)
+            .create_index_file().expect("create cache manager")
+            .populate_hashmap().expect("create cache manager");
+
+        let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
+
+        let val = cache_manager.validate_config(&test_image_digest);
+
+        assert_eq!(val.is_err(), false);
     }
 
     #[tokio::test]
     async fn test_cached_image() -> Result<(), TestError> {
         let (image, cache_manager) = setup_test().await;
 
+        let image_hash = image.get_image_hash().expect("extract image hash");
         let cached_image_bytes = ImageContents::fetch(
-                CacheManager::get_custom_image_folder_path(&image, cache_manager.cache_path())
-                    .expect("Failed to get image folder path.")
-            ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+            cache_manager.get_image_folder_path(&image_hash)
+        ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         let image_bytes = extract::extract_image(image.data()).unwrap();
         assert_eq!(cached_image_bytes, image_bytes);
@@ -745,10 +672,10 @@ mod tests {
     async fn test_cached_layers() -> Result<(), TestError> {
         let (image, cache_manager) = setup_test().await;
 
+        let image_hash = image.get_image_hash().expect("extract image hash");
         let cached_layers = ImageLayers::fetch(
-                CacheManager::get_custom_image_folder_path(&image, cache_manager.cache_path())
-                    .expect("Failed to get image folder path.")
-            ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+            cache_manager.get_image_folder_path(&image_hash)
+        ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         let layers = extract::extract_layers(image.data()).unwrap();
 
@@ -763,14 +690,20 @@ mod tests {
     async fn test_cached_config() -> Result<(), TestError> {
         let (image, cache_manager) = setup_test().await;
 
+        let image_hash = image.get_image_hash().expect("extract image hash");
         let cached_config = ImageConfig::fetch(
-            CacheManager::get_custom_image_folder_path(&image, cache_manager.cache_path())
-                    .expect("Failed to get image folder path.")
+            cache_manager.get_image_folder_path(&image_hash)
         ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         let config_str = extract::extract_config_json(image.data()).unwrap();
 
-        assert_eq!(cached_config, config_str);
+        // Create JSON Values from the strings in order to ignore the whitespaces from the cached config file
+        let cached_config_val: serde_json::Value = serde_json::from_str(cached_config.as_str())
+            .expect("JSON parsing error.");
+        let config_val: serde_json::Value = serde_json::from_str(config_str.as_str())
+            .expect("JSON parsing error.");
+
+        assert_eq!(cached_config_val, config_val);
 
         Ok(())
     }
@@ -779,14 +712,20 @@ mod tests {
     async fn test_cached_manifest() -> Result<(), TestError> {
         let (image, cache_manager) = setup_test().await;
         
+        let image_hash = image.get_image_hash().expect("extract image hash");
         let cached_manifest = ImageManifest::fetch(
-            CacheManager::get_custom_image_folder_path(&image, cache_manager.cache_path())
-                    .expect("Failed to get image folder path.")
+            cache_manager.get_image_folder_path(&image_hash)
         ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         let manifest_str = extract::extract_manifest_json(image.data()).unwrap();
 
-        assert_eq!(cached_manifest, manifest_str);
+        // Create JSON Values from the strings in order to ignore the whitespaces from the cached manifest file
+        let cached_manifest_val: serde_json::Value = serde_json::from_str(cached_manifest.as_str())
+            .expect("JSON parsing error.");
+        let manifest_val: serde_json::Value = serde_json::from_str(manifest_str.as_str())
+            .expect("JSON parsing error.");
+
+        assert_eq!(cached_manifest_val, manifest_val);
 
         Ok(())
     }
@@ -795,9 +734,9 @@ mod tests {
     async fn test_cached_env_expressions() -> Result<(), TestError> {
         let (image, cache_manager) = setup_test().await;
 
+        let image_hash = image.get_image_hash().expect("extract image hash");
         let cached_env_expr = EnvExpressions::fetch(
-            CacheManager::get_custom_image_folder_path(&image, cache_manager.cache_path())
-                    .expect("Failed to get image folder path.")
+            cache_manager.get_image_folder_path(&image_hash)
         ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         let env_expr = extract::extract_env_expressions(image.data()).unwrap();
@@ -813,9 +752,9 @@ mod tests {
     async fn test_cached_cmd_expressions() -> Result<(), TestError> {
         let (image, cache_manager) = setup_test().await;
 
+        let image_hash = image.get_image_hash().expect("extract image hash");
         let cached_cmd_expr = CmdExpressions::fetch(
-            CacheManager::get_custom_image_folder_path(&image, cache_manager.cache_path())
-                    .expect("Failed to get image folder path.")
+            cache_manager.get_image_folder_path(&image_hash)
         ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
 
         let cmd_expr = extract::extract_cmd_expressions(image.data()).unwrap();

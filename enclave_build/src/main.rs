@@ -11,6 +11,7 @@ mod constants;
 mod cache_manager;
 mod cache;
 mod extract;
+mod pull;
 
 fn main() {
     let matches = App::new("Docker2Eif builder")

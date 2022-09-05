@@ -4,21 +4,27 @@
 use std::collections::{HashMap};
 use std::fs::File;
 use std::io::{Read};
-use std::path::{PathBuf, Path};
+use std::path::{PathBuf, Path, self};
 use std::fs;
 use std::env;
 
 use oci_distribution::{Reference, client::ImageData};
+use sha2::Digest;
 
-use crate::constants;
-use crate::extract::{self, ExtractError};
+use crate::cache;
+use crate::pull;
+use crate::constants::{self, CACHE_MANIFEST_FILE_NAME, CACHE_CONFIG_FILE_NAME};
+use crate::extract::{self, ExtractError, extract_image_hash};
+use crate::cache::{StoreResult, StoreError};
 
 #[derive(Debug, PartialEq)]
 pub enum CacheManagerError {
     PathError(String),
     StoreError(String),
     RetrieveError(String),
-    GetImageHashError(String)
+    ValidateError(String),
+    ManifestNotValid,
+    ConfigNotValid,
 }
 
 /// Wrapper struct which represents an image
@@ -62,9 +68,14 @@ impl Image {
         image_ref.repository().split('/').collect::<Vec<&str>>().get(1).unwrap().to_string()
     }
 
+    /// Returns the digest hash of an image by extracting it from the struct
+    pub fn get_image_hash(&self) -> Result<String, ExtractError> {
+        extract_image_hash(&self.data)
+    }
+
     /// Returns the digest hash of an image by looking first in the cache,
     /// then trying to extract it from the Image struct
-    pub fn get_image_hash(&self, cache_manager: &CacheManager) -> Result<String, ExtractError> {
+    pub fn get_image_hash_first_from_cache(&self, cache_manager: &CacheManager) -> Result<String, ExtractError> {
         // Try to get the hash from the cache by looking up the image reference
         match cache_manager.get_image_hash(&self.reference.whole()) {
             Some(hash) => Ok(hash),
@@ -79,7 +90,7 @@ impl Image {
 
 /// Keeps a record of images stored in the cache and updates the index.json file
 /// 
-/// Also contains logic for creating the cache folders
+/// Also contains logic for updating and handling the cache
 /// 
 /// The index.json file is located in the cache root and keeps track of images stored in cache
 /// 
@@ -135,12 +146,88 @@ impl CacheManager {
         self.values.get(uri).map(|val| val.to_string())
     }
 
-    /// Checks if the image with the specified uri is cached
-    pub fn is_cached(&self, uri: &String) -> bool {
-        match self.get_image_hash(uri) {
-            Some(_) => true,
-            None => false
+    /// Checks if an image is correctly cached
+    pub async fn is_cached(&self, image_name: &String) -> Result<bool, CacheManagerError> {
+        let image_ref = Image::build_image_reference(image_name)
+            .map_err(|_| CacheManagerError::ValidateError("".to_string()))?;
+
+        // If the image is not found in the index.json file, it is definitely not cached
+        let image_hash = self.get_image_hash(&image_ref.whole());
+        if image_hash.is_none() {
+            return Ok(false);
         }
+        let image_hash = image_hash.unwrap();
+
+        // The hash was found, now check that the manifest and config are also cached and correct
+        // Pull the image manifest in order to find the manifest's and config's digests
+        let (pulled_manifest, _) = pull::pull_manifest(&image_ref)
+            .await
+            .map_err(|err| CacheManagerError::ValidateError(format!("{:?}", err)))?;
+        let pulled_manifest_str = serde_json::to_string(&pulled_manifest)
+            .map_err(|err| CacheManagerError::ValidateError(format!("{:?}", err)))?;
+
+        // Validate the manifest
+        if self.validate_manifest(&image_hash, &pulled_manifest_str).is_err() {
+            return Ok(false);
+        }
+
+        // Validate the config
+        if self.validate_config(&image_hash).is_err() {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Caches the image at the path provided in the CacheManager object
+    /// 
+    /// The cache root folder path should already be created
+    /// 
+    /// This function checks if the image is already cached, and, if not, pulls the image
+    /// from the remote registry
+    pub async fn cache_image(&mut self, image_name: &String) -> StoreResult<()> {
+        // Check if the image is already cached
+        let res = self.is_cached(image_name)
+            .await
+            .map_err(|err| StoreError::ImageError(format!("Error when validating cached image: {:?}", err)))?;
+        
+        // If the image is already cached, exit the function
+        if res == true {
+            println!("Image {} is already cached.", image_name);
+            return Ok(());
+        }
+
+        // The image is not correctly cached or not cached at all, so pull it from the remote registry
+        let image_data = pull::pull_image_data(&image_name)
+            .await
+            .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+        // Build the image reference
+        let image_ref = Image::build_image_reference(image_name)
+            .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+
+        let image = Image::new(image_ref, image_data);
+        let image_hash = image.get_image_hash()
+            .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+
+        // Determine the path of the folder where the image data will be stored
+        let image_folder_path = self.get_image_folder_path(&image_hash);
+
+        // Create the folder where the image data will be stored
+        self.create_image_folder(&image_hash)
+            .map_err(|err| StoreError::ImageError(format!("{:?}", err)))?;
+
+        // Store the image data in the cache
+        let _ = cache::store_image_data(&image, &image_folder_path)?;
+
+        // Add the image to the CacheManager's HashMap
+        self.record_image(&image)
+            .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
+
+        // Serialize the CacheManager's hashmap to the index.json file
+        self.write_index_file()
+            .map_err(|err| StoreError::IndexJsonError(format!("{:?}", err)))?;
+
+        Ok(())
     }
 
     /// Record the new image that was added to the cache (add it to the CacheManager's hashmap)
@@ -241,6 +328,157 @@ impl CacheManager {
                 "Failed to write to the index.json file: {:?}", err)))
     }
 
+    /// Calculates the cache path of the image layers
+    pub fn get_layers_cache_path(&self, image_hash: &String) -> PathBuf {
+        let mut path = self.get_image_folder_path(image_hash);
+        path.push(constants::CACHE_LAYERS_FOLDER_NAME);
+
+        path
+    }
+
+    /// Calculates the cache path of the image manifest
+    pub fn get_manifest_cache_path(&self, image_hash: &String) -> PathBuf {
+        let mut path = self.get_image_folder_path(image_hash);
+        path.push(constants::CACHE_MANIFEST_FILE_NAME);
+
+        path
+    }
+    
+    /// Calculates the cache path of the image config
+    pub fn get_config_cache_path(&self, image_hash: &String) -> PathBuf {
+        let mut path = self.get_image_folder_path(image_hash);
+        path.push(constants::CACHE_CONFIG_FILE_NAME);
+
+        path
+    }
+
+    pub fn get_layers(&self, image_hash: &String) -> Result<Vec<File>, CacheManagerError> {
+        let path = self.get_layers_cache_path(image_hash);
+
+        let layers: Vec<File> =
+            fs::read_dir(&path)
+                .map_err(|err|
+                    CacheManagerError::RetrieveError(format!("Failed to get image layers: {:?}", err)))?
+                .into_iter()
+                .filter(|entry| entry.is_ok())
+                // Get only the files
+                .filter(|entry| entry.as_ref().unwrap().path().is_file())
+                .map(|file| File::open(&file.unwrap().path()))
+                .filter_map(|file| file.ok().and_then(|f| Some(f)))
+                .collect();
+
+        Ok(layers)
+    }
+
+    /// Returns the cached image manifest as a file
+    pub fn get_manifest_file(&self, image_hash: &String) -> Result<File, CacheManagerError> {
+        let path = self.get_manifest_cache_path(image_hash);
+
+        File::open(&path)
+            .map_err(|err|
+                CacheManagerError::RetrieveError(format!("Failed to get cached manifest file: {:?}", err)))
+    }
+
+    /// Returns the cached image config as a file
+    pub fn get_config_file(&self, image_hash: &String) -> Result<File, CacheManagerError> {
+        let path = self.get_config_cache_path(image_hash);
+
+        File::open(&path)
+            .map_err(|err|
+                CacheManagerError::RetrieveError(format!("Failed to get cached config file: {:?}", err)))
+    }
+
+    /// Checks that the image manifest is cached
+    pub fn validate_manifest(
+        &self,
+        image_digest: &String,
+        pulled_manifest: &String
+    ) -> Result<(), CacheManagerError> {
+        let manifest_file = self.get_manifest_file(image_digest);
+
+        // Read the manifest from the cache
+        let mut cached_manifest = String::new();
+        manifest_file
+            .map_err(|_| CacheManagerError::ManifestNotValid)?
+            .read_to_string(&mut cached_manifest)
+                .map_err(|_| CacheManagerError::ManifestNotValid)?;
+
+        // Calculate the sha256 digest of the cached manifest in order to validate the contents
+        let cached_digest = format!("{:x}", sha2::Sha256::digest(cached_manifest.as_bytes()));
+
+        // Calculate the sha256 digest of the cached manifest
+        let pulled_digest = format!("{:x}", sha2::Sha256::digest(pulled_manifest.as_bytes()));
+
+        // Check that the two digests are equal
+        match *pulled_digest == cached_digest {
+            true => Ok(()),
+            false => Err(CacheManagerError::ManifestNotValid)
+        }
+    }
+
+    // pub fn validate_layers(
+    //     &self,
+    //     image_digest: &String
+    // ) -> Result<(), CacheManagerError> {
+        
+    // }
+
+    /// Checks that the image config is cached
+    pub fn validate_config(
+        &self,
+        image_digest: &String,
+    ) -> Result<(), CacheManagerError> {
+        let config_file = self.get_config_file(image_digest);
+        let mut manifest_file = self.get_manifest_file(image_digest)
+            .map_err(|err| CacheManagerError::ValidateError(format!("{:?}", err)))?;
+
+        // Read the config from the cache
+        let mut config_str = String::new();
+        config_file
+            .map_err(|_| CacheManagerError::ConfigNotValid)?
+            .read_to_string(&mut config_str)
+                .map_err(|_| CacheManagerError::ConfigNotValid)?;
+
+        // Calculate the sha256 digest of the cached config in order to validate the contents
+        let cached_digest = format!("{:x}", sha2::Sha256::digest(config_str.as_bytes()));
+
+        // Now get the correct digest from the manifest and check that the two digests match
+        let config_digest = self.get_config_digest_from_manifest(&mut manifest_file)
+            .map_err(|err| CacheManagerError::RetrieveError(format!("{:?}", err)))?;
+
+        // Check that the two digests are equal
+        match config_digest == cached_digest {
+            true => Ok(()),
+            false => Err(CacheManagerError::ConfigNotValid)
+        }
+    }
+
+    /// Determines the config digest of an image by reading from the manifest file provided as parameter
+    pub fn get_config_digest_from_manifest(&self, manifest: &mut File) -> Result<String, CacheManagerError> {
+        // Read the manifest string from the file
+        let mut manifest_str = String::new();
+        manifest
+            .read_to_string(&mut manifest_str)
+                .map_err(|err| CacheManagerError::RetrieveError(format!("{:?}", err)))?;
+
+        let json_obj: serde_json::Value = serde_json::from_str(manifest_str.as_str())
+                .map_err(|err| CacheManagerError::RetrieveError("Could not parse manifest JSON.".to_string()))?;
+
+        // Extract the config digest hash
+        let config_digest = json_obj
+            .get("config").ok_or_else(||
+                CacheManagerError::RetrieveError("'config' field missing from image manifest.".to_string()))?
+            .get("digest").ok_or_else(||
+                CacheManagerError::RetrieveError("'digest' field missing from image manifest.".to_string()))?
+            .as_str().ok_or_else(||
+                CacheManagerError::RetrieveError("Failed to get config digest from image manifest.".to_string()))?
+            .strip_prefix("sha256:").ok_or_else(||
+                CacheManagerError::RetrieveError("Failed to get config digest from image manifest.".to_string()))?
+            .to_string();
+
+        Ok(config_digest)
+    }
+
     /// Returns the default root folder path of the cache
     /// 
     /// If the TEST_MODE_ENABLED constant is set to true, ./test_cache/container_cache
@@ -277,39 +515,44 @@ impl CacheManager {
         Ok(path)
     }
 
+    /// Returns the path to the cache root folder of an image by using the image hash provided
+    /// as argument
+    pub fn get_image_folder_path(&self, image_hash: &String) -> PathBuf {
+        let mut path = self.cache_path.clone();
+        path.push(image_hash);
 
-    /// Returns the default path to the cache root folder of an image:
-    /// 
-    /// {ROOT}/.nitro_cli/container_cache/{IMAGE_HASH}
-    pub fn get_default_image_folder_path(image: &Image, cache_manager: &CacheManager) -> Result<PathBuf, CacheManagerError> {
-        // Get the image hash
-        let hash = Image::get_image_hash(image, cache_manager).map_err(|err|
-            CacheManagerError::PathError(format!("Failed to determine the image folder path: {:?}", err)))?;
+        path
+    }
 
-        // Get the cache root folder
-        let mut cache_root = Self::get_default_cache_root_path()
+    /// Creates all folders from the cache path provided in the current CacheManager object
+    pub fn create_cache_folders(&self) -> Result<(), CacheManagerError> {
+        fs::create_dir_all(&self.cache_path)
             .map_err(|err| CacheManagerError::PathError(format!(
-                "Failed to determine the image folder path: {:?}", err)))?;
+                "Failed to create the cache folder path: {:?}", err)))
+    }
 
-        cache_root.push(hash);
-
-        Ok(cache_root)
+    /// Creates the cache folder where the image data will be stored (the folder is created
+    /// at the path provided in the current CacheManager object)
+    /// 
+    /// The function also creates all folders from the path that are not already created
+    pub fn create_image_folder(&self, image_hash: &String) -> Result<(), CacheManagerError> {
+        let mut path = self.get_image_folder_path(image_hash);
+        
+        fs::create_dir_all(&path).map_err(|err|
+            CacheManagerError::PathError(format!("Failed to create the image cache folder: {:?}", err)))
     }
 
     /// Determines the path of the image cache folder considering the cache root as the path
     /// given as parameter
-    pub fn get_custom_image_folder_path(image: &Image, cache_path: &PathBuf) -> Result<PathBuf, CacheManagerError> {
+    pub fn get_custom_image_folder_path(image_hash: &String, cache_path: &PathBuf) -> PathBuf {
         let mut image_folder_path = cache_path.clone();
-
         // Build the image folder path by appending the image hash at the end of the provided path
-        image_folder_path.push(extract::extract_image_hash(&image.data())
-            .map_err(|err| CacheManagerError::PathError(format!(
-                "Failed to determine the image cache folder: {:?}", err)))?);
+        image_folder_path.push(&image_hash);
 
-        Ok(image_folder_path)
+        image_folder_path
     }
 
-    /// Creates all folders from the path of the cache given as parameter
+    /// Creates all folders from the path given as parameter
     pub fn create_cache_folder_path(cache_path: &PathBuf) -> Result<(), CacheManagerError> {
         fs::create_dir_all(cache_path)
             .map_err(|err| CacheManagerError::PathError(format!(
@@ -320,11 +563,10 @@ impl CacheManager {
     /// in the directory given as parameter)
     /// 
     /// The function also creates all folders from the path that are not already created
-    pub fn create_image_folder(image: &Image, cache_path: &PathBuf) -> Result<(), CacheManagerError> {
-        let image_folder_path = Self::get_custom_image_folder_path(image, cache_path).map_err(|err|
-            CacheManagerError::PathError(format!("Failed to create the image cache folder: {:?}", err)))?;
+    pub fn create_image_folder_to_path(image_hash: &String, cache_path: &PathBuf) -> Result<(), CacheManagerError> {
+        let image_folder_path = Self::get_custom_image_folder_path(image_hash, cache_path);
 
-        fs::create_dir_all(image_folder_path).map_err(|err|
+        fs::create_dir_all(&image_folder_path).map_err(|err|
             CacheManagerError::PathError(format!("Failed to create the image cache folder: {:?}", err)))
     }
 }
