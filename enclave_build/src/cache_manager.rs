@@ -2,21 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap};
-use std::convert::TryInto;
 use std::fs::File;
 use std::io::{Read};
 use std::ops::Deref;
-use std::path::{PathBuf, Path, self};
+use std::path::{PathBuf, Path};
 use std::fs;
 use std::env;
 
 use oci_distribution::{Reference, client::ImageData};
-use serde_json::to_string;
 use sha2::Digest;
 
 use crate::cache;
 use crate::pull;
-use crate::constants::{self, CACHE_MANIFEST_FILE_NAME, CACHE_CONFIG_FILE_NAME};
+use crate::constants;
 use crate::extract::{self, ExtractError, extract_image_hash};
 use crate::cache::{StoreResult, StoreError};
 
@@ -254,12 +252,24 @@ impl CacheManager {
         self.values.insert(uri.to_string(), hash.to_string());
     }
 
+    /// Created the cache folders, if not already created
+    /// 
+    /// The function creates the folders specified in the 'cache_path' field
+    /// 
+    /// Should be called first when instantiating a new CacheManager object
+    pub fn create_cache(self) -> Result<Self, CacheManagerError> {
+        fs::create_dir_all(&self.cache_path).map_err(|err|
+            CacheManagerError::PathError(format!("Failed to create cache folders: {:?}", err)))?;
+
+        Ok(self)
+    }
+
     /// Creates the cache index.json file, if not already created
     /// 
     /// The file is created at the location specified by the 'cache_path' field of the current
     /// CacheManager object
     ///
-    /// Should be called when instantiating a new CacheManager object
+    /// Should be called when instantiating a new CacheManager object, after create_cache was called
     pub fn create_index_file(self) -> Result<Self, CacheManagerError> {
         let mut index_file_path = self.cache_path.clone();
         index_file_path.push(constants::CACHE_INDEX_FILE_NAME);

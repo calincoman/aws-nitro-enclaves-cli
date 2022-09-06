@@ -563,8 +563,9 @@ mod tests {
 
         // Create the CacheManager
         let cache_manager = CacheManager::new(&cache_folder_path)
-            .create_index_file().expect("create cache manager")
-            .populate_hashmap().expect("create cache manager");
+            .create_cache().expect("create cache folders")
+            .create_index_file().expect("create index.json file")
+            .populate_hashmap().expect("read index.json file");
 
         cache_manager
     }
