@@ -605,16 +605,20 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_validate_layers() {
+        let cache_manager = create_test_cache_manager();
+
+        let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
+
+        let res = cache_manager.validate_layers(&test_image_digest);
+
+        assert_eq!(res.is_err(), false);
+    }
+
     #[tokio::test]
     async fn test_validate_manifest() {
-        // Get the root folder of the cache
-        let cache_folder_path = CacheManager::get_default_cache_root_path()
-            .expect("get cache root path");
-
-        // Create the CacheManager
-        let mut cache_manager = CacheManager::new(&cache_folder_path)
-            .create_index_file().expect("create cache manager")
-            .populate_hashmap().expect("create cache manager");
+        let cache_manager = create_test_cache_manager();
 
         let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
 
@@ -637,14 +641,7 @@ mod tests {
 
     #[test]
     fn test_validate_config() {
-        // Get the root folder of the cache
-        let cache_folder_path = CacheManager::get_default_cache_root_path()
-            .expect("get cache root path");
-
-        // Create the CacheManager
-        let cache_manager = CacheManager::new(&cache_folder_path)
-            .create_index_file().expect("create cache manager")
-            .populate_hashmap().expect("create cache manager");
+        let cache_manager = create_test_cache_manager();
 
         let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
 

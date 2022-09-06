@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap};
+use std::convert::TryInto;
 use std::fs::File;
 use std::io::{Read};
+use std::ops::Deref;
 use std::path::{PathBuf, Path, self};
 use std::fs;
 use std::env;
 
 use oci_distribution::{Reference, client::ImageData};
+use serde_json::to_string;
 use sha2::Digest;
 
 use crate::cache;
@@ -25,6 +28,7 @@ pub enum CacheManagerError {
     ValidateError(String),
     ManifestNotValid,
     ConfigNotValid,
+    LayersNotValid
 }
 
 /// Wrapper struct which represents an image
@@ -352,20 +356,27 @@ impl CacheManager {
         path
     }
 
-    pub fn get_layers(&self, image_hash: &String) -> Result<Vec<File>, CacheManagerError> {
+    /// Returns a HashMap containing all cached layers of an image which maps a layer digest to the corresponding
+    /// layer file
+    pub fn get_layers(&self, image_hash: &String) -> Result<HashMap<String, File>, CacheManagerError> {
         let path = self.get_layers_cache_path(image_hash);
 
-        let layers: Vec<File> =
-            fs::read_dir(&path)
-                .map_err(|err|
-                    CacheManagerError::RetrieveError(format!("Failed to get image layers: {:?}", err)))?
-                .into_iter()
-                .filter(|entry| entry.is_ok())
-                // Get only the files
-                .filter(|entry| entry.as_ref().unwrap().path().is_file())
-                .map(|file| File::open(&file.unwrap().path()))
-                .filter_map(|file| file.ok().and_then(|f| Some(f)))
-                .collect();
+        let mut layers: HashMap<String, File> = HashMap::new();
+
+        fs::read_dir(&path)
+            .map_err(|err|
+                CacheManagerError::RetrieveError(format!("Failed to get image layers: {:?}", err)))?
+            .into_iter()
+            .filter(|entry| entry.is_ok())
+            // Get only the files
+            .filter(|entry| entry.as_ref().unwrap().path().is_file())
+            .map(|file| (File::open(file.as_ref().unwrap().path()), file.unwrap().file_name()))
+            .filter(|(file, name)| file.is_ok())
+            .map(|(file, name)| (file.unwrap(), name.into_string().unwrap()))
+            // Map a layer digest to the layer file
+            .for_each(|(file, name)| {
+                layers.insert(name, file);
+            });
 
         Ok(layers)
     }
@@ -386,6 +397,72 @@ impl CacheManager {
         File::open(&path)
             .map_err(|err|
                 CacheManagerError::RetrieveError(format!("Failed to get cached config file: {:?}", err)))
+    }
+
+    /// Checks that the layers are cached
+    pub fn validate_layers(
+        &self,
+        image_digest: &String
+    ) -> Result<(), CacheManagerError> {
+        // Get the layers from cache
+        let cached_layers = self.get_layers(image_digest)
+            .map_err(|_| CacheManagerError::LayersNotValid)?;
+
+        // Get the manifest file from cache and read the contents
+        let mut manifest_file = self.get_manifest_file(image_digest)
+            .map_err(|_| CacheManagerError::ManifestNotValid)?;
+        let mut manifest_str = String::new();
+        manifest_file.read_to_string(&mut manifest_str).map_err(|err|
+            CacheManagerError::ValidateError(format!("Failed to read from cached manifest: {:?}", err)))?;
+        let manifest_obj: serde_json::Value = serde_json::from_str(manifest_str.as_str())
+            .map_err(|err| CacheManagerError::ValidateError(format!("Failed to serialize manifest: {:?}", err)))?;
+        
+        // Try to get the layer list from the manifest
+        let layers_vec: Vec<serde_json::Value> = manifest_obj
+            .get("layers").ok_or_else(||
+                CacheManagerError::ValidateError(format!("'layers' field missing from manifest JSON.")))?
+            .as_array()
+            .ok_or_else(|| CacheManagerError::ValidateError("Manifest deserialize error.".to_string()))?
+            .to_vec();
+
+        // Iterate through each layer found in the image manifest and validate that it is stored in
+        // the cache by checking the digest
+        for layer_obj in layers_vec {
+            // Read the layer size from the manifest
+            let layer_size: u64 = layer_obj
+                .get("size").ok_or_else(||
+                    CacheManagerError::ValidateError("Image layer size not found in manifest.".to_string()))?
+                .as_u64()
+                .ok_or_else(|| CacheManagerError::ValidateError("Layer info extract error.".to_string()))?;
+
+            // Read the layer digest from the manifest
+            let layer_digest: String = layer_obj
+                .get("digest").ok_or_else(||
+                    CacheManagerError::ValidateError("Image layer digest not found in manifest".to_string()))?
+                .as_str().ok_or_else(||
+                    CacheManagerError::ValidateError("Layer info extract error".to_string()))?
+                .strip_prefix("sha256:").ok_or_else(||
+                    CacheManagerError::ValidateError("Layer info extract error".to_string()))?
+                .to_string();
+
+            // Get the cached layer file matching the digest
+            // If not present, then a layer file is missing, so return Error
+            let layer_file = cached_layers.get(&layer_digest)
+                    .ok_or_else(|| CacheManagerError::LayersNotValid)?;
+
+            // Get the size in bytes of the layer file
+            let size = layer_file.deref()
+                .metadata().map_err(|_|
+                    CacheManagerError::ValidateError("Failed to extract metadata from layer file.".to_string()))?
+                .len();
+
+            // Check that the sizes match
+            if layer_size != size {
+                return Err(CacheManagerError::LayersNotValid);
+            }
+        }
+
+        Ok(())
     }
 
     /// Checks that the image manifest is cached
@@ -415,13 +492,6 @@ impl CacheManager {
             false => Err(CacheManagerError::ManifestNotValid)
         }
     }
-
-    // pub fn validate_layers(
-    //     &self,
-    //     image_digest: &String
-    // ) -> Result<(), CacheManagerError> {
-        
-    // }
 
     /// Checks that the image config is cached
     pub fn validate_config(
