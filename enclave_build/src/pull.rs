@@ -1,57 +1,48 @@
-// Copyright 2019-2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2019-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
 use std::path::Path;
 
 use oci_distribution::{
-    Reference,
-    RegistryOperation,
-    client::{
-        Client,
-        ClientProtocol,
-        ClientConfig,
-        ImageData
-    },
-    secrets::{RegistryAuth},
-    manifest::OciImageManifest
+    client::{Client, ClientConfig, ClientProtocol, ImageData},
+    secrets::RegistryAuth,
 };
 
-use crate::cache_manager::{Image};
-use crate::constants;
+use crate::{constants, image::Image};
 
-#[derive(Debug)]
-pub enum PullError {
-    ImagePullError(String),
-    ManifestPullError(String),
+#[derive(Debug, PartialEq)]
+pub enum Error {
+    ImageError(String),
+    ManifestDigestError(String),
     DockerConfigFileError(String),
     CredentialsError(String),
-    InvalidCredentials,
 }
 
-impl std::fmt::Display for PullError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            PullError::ImagePullError(msg) =>
-                write!(f, "Could not pull image data from remote registry: {}", msg),
-            PullError::ManifestPullError(msg) =>
-                write!(f, "Failed to pull image manifest: {}", msg),
-            PullError::DockerConfigFileError(msg) =>
-                write!(f, "{}", msg),
-            PullError::CredentialsError(msg) =>
-                write!(f, "{}", msg),
-            PullError::InvalidCredentials =>
-                write!(f, "Credentials from the Docker config file are not correct.")
+            Error::ImageError(msg) => {
+                write!(f, "Could not pull image data from remote registry: {}", msg)
+            }
+            Error::ManifestDigestError(msg) => {
+                write!(f, "Failed to pull image manifest digest: {}", msg)
+            }
+            Error::DockerConfigFileError(msg) => write!(f, "{}", msg),
+            Error::CredentialsError(msg) => write!(f, "{}", msg),
         }
     }
 }
 
-impl std::error::Error for PullError {}
+impl std::error::Error for Error {}
 
-pub type PullResult<T> = std::result::Result<T, PullError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// Builds a client which uses the protocol given as parameter
-/// Client required for the https://github.com/krustlet/oci-distribution library API
+/// Builds a client which uses the protocol given as parameter.
+///
+/// Client required for the https://github.com/krustlet/oci-distribution library API.
+///
+/// By default, the client pulls the image matching the current running architecture.
 pub fn build_client(protocol: ClientProtocol) -> Client {
     let client_config = ClientConfig {
         protocol,
@@ -62,12 +53,15 @@ pub fn build_client(protocol: ClientProtocol) -> Client {
 
 /// Returns the docker config file by searching first at the path pointed by DOCKER_CONFIG,
 /// and if this env is not set, at {HOME}/.docker/config.json
-fn get_docker_config_file() -> Result<File, PullError> {
+fn get_docker_config_file() -> Result<File> {
     // First check the DOCKER_CONFIG env variable for the path to the docker config file
     if let Ok(file) = std::env::var("DOCKER_CONFIG") {
         let config_file = File::open(file).map_err(|err| {
-            PullError::DockerConfigFileError(format!("Could not open file pointed by env variable\
-                DOCKER_CONFIG: {}", err))
+            Error::DockerConfigFileError(format!(
+                "Could not open file pointed by env variable\
+                DOCKER_CONFIG: {}",
+                err
+            ))
         })?;
         Ok(config_file)
     } else {
@@ -78,19 +72,25 @@ fn get_docker_config_file() -> Result<File, PullError> {
             let config_path = Path::new(&default_config_path);
             if config_path.exists() {
                 let config_file = File::open(config_path).map_err(|err| {
-                    PullError::DockerConfigFileError(format!(
-                        "Could not open file {:?}: {:?}", config_path.to_str(), err))
+                    Error::DockerConfigFileError(format!(
+                        "Could not open file {:?}: {:?}",
+                        config_path.to_str(),
+                        err
+                    ))
                 })?;
                 return Ok(config_file);
             }
         }
-        Err(PullError::DockerConfigFileError("Config file not present, please set env variable \
-             DOCKER_CONFIG accordingly".to_string()))
+        Err(Error::DockerConfigFileError(
+            "Config file not present, please set env variable \
+             DOCKER_CONFIG"
+                .to_string(),
+        ))
     }
 }
 
 /// Returns the Docker credentials by reading from the Docker config.json file
-/// 
+///
 /// The assumed format of the file is:\
 /// {\
 ///        "auths": {\
@@ -99,14 +99,15 @@ fn get_docker_config_file() -> Result<File, PullError> {
 ///            }\
 ///        }\
 /// }
-pub fn parse_credentials() -> Result<RegistryAuth, PullError> {
+pub fn parse_credentials() -> Result<RegistryAuth> {
     let config_file = get_docker_config_file()?;
 
-    let config_json: serde_json::Value = serde_json::from_reader(&config_file)
-        .map_err(|err| PullError::CredentialsError(format!("JSON was not well-formatted: {}", err)))?;
+    let config_json: serde_json::Value = serde_json::from_reader(&config_file).map_err(|err| {
+        Error::CredentialsError(format!("JSON was not well-formatted: {}", err))
+    })?;
 
     let auths = config_json.get("auths").ok_or_else(|| {
-        PullError::CredentialsError("Could not find auths key in config JSON".to_string())
+        Error::CredentialsError("Could not find auths key in config JSON".to_string())
     })?;
 
     if let serde_json::Value::Object(auths) = auths {
@@ -114,34 +115,41 @@ pub fn parse_credentials() -> Result<RegistryAuth, PullError> {
             let auth = registry_auths
                 .get("auth")
                 .ok_or_else(|| {
-                    PullError::CredentialsError("Could not find auth key in config JSON".to_string())
+                    Error::CredentialsError(
+                        "Could not find auth key in config JSON".to_string(),
+                    )
                 })?
                 .to_string();
 
             let auth = auth.replace('"', "");
             // Decode the auth token
             let decoded = base64::decode(&auth).map_err(|err| {
-                PullError::CredentialsError(format!("Invalid Base64 encoding for auth: {}", err))
+                Error::CredentialsError(format!("Invalid Base64 encoding for auth: {}", err))
             })?;
             let decoded = std::str::from_utf8(&decoded).map_err(|err| {
-                PullError::CredentialsError(format!("Invalid utf8 encoding for auth: {}", err))
+                Error::CredentialsError(format!("Invalid utf8 encoding for auth: {}", err))
             })?;
 
             // Try to get the username and the password
             if let Some(index) = decoded.rfind(':') {
                 let (username, after_user) = decoded.split_at(index);
                 let (_, password) = after_user.split_at(1);
-                
-                return Ok(RegistryAuth::Basic(username.to_string(), password.to_string()));
+
+                return Ok(RegistryAuth::Basic(
+                    username.to_string(),
+                    password.to_string(),
+                ));
             }
         }
     }
 
     // If the auth token is missing, return error
-    Err(PullError::CredentialsError("Credentials not found".to_string()))
+    Err(Error::CredentialsError(
+        "Credentials not found.".to_string(),
+    ))
 }
 
-/// Determines the authentication for the pull operation
+/// Determines the authentication for interacting with the remote registry.
 pub fn docker_auth() -> RegistryAuth {
     match parse_credentials() {
         Ok(registry_auth) => {
@@ -149,46 +157,52 @@ pub fn docker_auth() -> RegistryAuth {
             registry_auth
         }
         Err(err) => {
-            println!("Credential error: {:?}, performing anonymous pull", err);
+            println!("Credentials error: {:?}, performing anonymous pull", err);
             RegistryAuth::Anonymous
         }
     }
 }
 
 /// Pulls an image (all blobs - layers, manifest and config) from the Docker remote registry
-pub async fn pull_image_data(image_name: &String) -> PullResult<ImageData> {
+pub async fn pull_image_data(image_name: &String) -> Result<ImageData> {
     // Build the client required for the pulling - uses HTTPS protocol
     let mut client = build_client(ClientProtocol::Https);
 
-    // Build the image reference from the image name
-    let image_ref = Image::build_image_reference(image_name)
-        .map_err(|err| PullError::ImagePullError(err.to_string()))?;
-    
-    // Try to get the credentials from the Docker config file
+    // Build an image reference from the image name
+    let image_ref = Image::image_reference(image_name)
+        .map_err(|err| Error::ImageError(format!("{:?}", err)))?;
+
+    // Try to get the credentials from the Docker config file for authentication
     let auth = docker_auth();
-    
-    // Pull the ImageData struct containing the layers, manifest and configuration file
+
+    // Pull an ImageData struct containing the layers, manifest and configuration file
     let image_data = client
         .pull(&image_ref, &auth, constants::ACCEPTED_MEDIA_TYPES.to_vec())
         .await;
 
     match image_data {
         Ok(img_data) => Ok(img_data),
-        Err(err) => Err(PullError::ImagePullError(err.to_string()))
+        Err(err) => Err(Error::ImageError(err.to_string())),
     }
 }
 
-pub async fn pull_manifest(image_ref: &Reference) -> PullResult<(OciImageManifest, String)> {
+/// Pulls from remote only the manifest digest
+pub async fn fetch_manifest_digest(image_name: &String) -> Result<String> {
     // Build the client required for the pulling - uses HTTPS protocol
     let mut client = build_client(ClientProtocol::Https);
 
     // Try to get the credentials from the Docker config file
     let auth = docker_auth();
 
-    // Pull the manifest and its digest from the remote registry
-    let (manifest, digest) = client.pull_image_manifest(&image_ref, &auth)
-        .await
-        .map_err(|err| PullError::ManifestPullError(format!("{:?}", err)))?;
+    // Build an image reference from the image name
+    let image_ref = Image::image_reference(image_name)
+        .map_err(|err| Error::ImageError(format!("{:?}", err)))?;
 
-    Ok((manifest, digest))
+    // Pull the manifest digest from the remote registry
+    let manifest_digest = client
+        .fetch_manifest_digest(&image_ref, &auth)
+        .await
+        .map_err(|err| Error::ManifestDigestError(format!("{:?}", err)))?;
+
+    Ok(manifest_digest)
 }
