@@ -99,6 +99,7 @@ impl ImageManager {
             // If the image is cached, fetch and return it
             if local_cache.is_cached(&image_name).is_ok() {
                 let image = local_cache.fetch_image(&image_name)?;
+                println!("Image found in local cache.");
                 return Ok(image);
             } else {
                 // The image is not cached, so try to pull and then cache it
