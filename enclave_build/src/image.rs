@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
+use crate::extract;
+
 #[derive(Debug, PartialEq)]
 pub enum Error {
     ImageRefError(oci_distribution::ParseError),
     ImageBuildError(String),
+    ImageConvertError(extract::Error)
 }
 
 impl std::fmt::Display for Error {
@@ -16,13 +19,76 @@ impl std::fmt::Display for Error {
         match self {
             Error::ImageRefError(err) => write!(f, "Conversion failed: {:?}", err),
             Error::ImageBuildError(msg) => write!(f, "Image struct creation failed: {}", msg),
+            Error::ImageConvertError(err) => write!(f, "Failed to convert from pulled struct: {:?}", err)
         }
+    }
+}
+
+impl From<extract::Error> for Error {
+    fn from(err: extract::Error) -> Self {
+        Error::ImageConvertError(err)
     }
 }
 
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// #[derive(Clone)]
+/// This struct contains the image data, with the manifest and config as raw JSON strings.
+/// 
+/// This is the struct fetched from the cache, and later deserialized in order to create
+/// an Image struct.
+pub struct ImageCacheFetch {
+    hash: String,
+
+    /// The image layers are an array of raw byte arrays
+    layers: Vec<Vec<u8>>,
+
+    /// The image manifest, represented as a JSON string
+    manifest: String,
+
+    /// The image config, represented as a JSON string
+    config: String,
+}
+
+impl ImageCacheFetch {
+    pub fn new<S: AsRef<str>>(
+        image_hash: S,
+        layers: Vec<Vec<u8>>,
+        manifest: String,
+        config: String
+    ) -> Self {
+        Self {
+            hash: image_hash.as_ref().to_string(),
+            layers,
+            manifest,
+            config
+        }
+    }
+
+    pub fn from(image_data: oci_distribution::client::ImageData) -> Result<Self> {
+        let image_hash = extract::extract_image_hash(&image_data)?;
+
+        let pulled_layers = extract::extract_layers(&image_data)?;
+        let layers: Vec<Vec<u8>> = pulled_layers
+            .into_iter()
+            .map(|layer| layer.data)
+            .collect();
+
+        let pulled_config = extract::extract_config_json(&image_data)?;
+        let pulled_manifest = extract::extract_manifest_json(&image_data)?;
+
+        Ok(
+            Self {
+                hash: image_hash,
+                layers: layers,
+                manifest: pulled_manifest,
+                config: pulled_config
+            }
+        )
+    }
+}
 
 #[derive(Clone)]
 /// Struct wrapping all data associated to an image: image layers, config, manifest etc.
@@ -199,7 +265,17 @@ pub struct Config {
 impl Config {
     /// Returns the image hash.
     pub fn image_hash(&self) -> Option<&str> {
-        self.image.as_deref()
+        match &self.image {
+            Some(hash_with_prefix) =>
+                // By default, the image hash is represented as "<hash_alg>:<hash_string>", so
+                // remove the <hash_alg> prefix to get the actual hash. The hash algorithm
+                // used is assumed to be sha256.
+                match hash_with_prefix.strip_prefix("sha256:") {
+                    Some(hash) => Some(hash),
+                    None => None
+                },
+            None => None
+        }
     }
 }
 

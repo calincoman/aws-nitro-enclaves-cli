@@ -1,21 +1,21 @@
-// Copyright 2019-2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2019-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use oci_distribution::client::{ImageLayer};
-use oci_distribution::client::{ImageData};
+use oci_distribution::client::ImageData;
+use oci_distribution::client::ImageLayer;
 
 use serde_json::Value;
 use std::fmt;
 
 /// This file contains the logic for the extraction of image data from an ImageData struct to be stored later
 /// in the local cache
-/// 
+///
 /// The ImageData struct represents the data of an image and is what the pull operation from
 /// https://github.com/krustlet/oci-distribution returns
 
 /// Errors when extracting data from an ImageData struct
 #[derive(Debug, PartialEq)]
-pub enum ExtractError {
+pub enum Error {
     ImageError,
     LayerError,
     ManifestError,
@@ -25,54 +25,55 @@ pub enum ExtractError {
     ImageHashError(Option<String>),
 }
 
-impl fmt::Display for ExtractError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ExtractError::ImageError =>
-                write!(f, "Failed to extract the image contents."),
-            ExtractError::LayerError =>
-                write!(f, "Failed to extract the layers of the image."),
-            ExtractError::ManifestError =>
-                write!(f, "Failed to extract the manifest JSON from the image data."),
-            ExtractError::ConfigError(err) =>
-                write!(f, "Failed to extract the config JSON from the image data: {:?}", err),
-            ExtractError::EnvError(msg) =>
-                write!(f, "{}", msg),
-            ExtractError::CmdError(msg) =>
-                write!(f, "{}", msg),
-            ExtractError::ImageHashError(msg) =>
-                match msg {
-                    Some(str) => write!(f, "Failed to extract the image hash: {}", str),
-                    None => write!(f, "Failed to extract the image hash")
-                }
+            Error::ImageError => write!(f, "Failed to extract the image contents."),
+            Error::LayerError => write!(f, "Failed to extract the layers of the image."),
+            Error::ManifestError => write!(
+                f,
+                "Failed to extract the manifest JSON from the image data."
+            ),
+            Error::ConfigError(err) => write!(
+                f,
+                "Failed to extract the config JSON from the image data: {:?}",
+                err
+            ),
+            Error::EnvError(msg) => write!(f, "{}", msg),
+            Error::CmdError(msg) => write!(f, "{}", msg),
+            Error::ImageHashError(msg) => match msg {
+                Some(str) => write!(f, "Failed to extract the image hash: {}", str),
+                None => write!(f, "Failed to extract the image hash"),
+            },
         }
     }
 }
 
-impl std::error::Error for ExtractError {}
+impl std::error::Error for Error {}
 
-type Result<T> = std::result::Result<T, ExtractError>;
+type Result<T> = std::result::Result<T, Error>;
 
 /// Extract the image itself (the image content, basically all layers combined) as a raw array of bytes
 pub fn extract_image(image_data: &ImageData) -> Result<Vec<u8>> {
     let image_bytes = image_data
-        .layers.clone()
+        .layers
+        .clone()
         .into_iter()
         .next()
         .map(|layer| layer.data)
-        .ok_or_else(|| ExtractError::ImageError)?;
+        .ok_or_else(|| Error::ImageError)?;
 
     match image_bytes.len() {
-        0 => Err(ExtractError::ImageError),
-        _ => Ok(image_bytes)
+        0 => Err(Error::ImageError),
+        _ => Ok(image_bytes),
     }
 }
 
 /// Extract the layers as an array of ImageLayer structs
 pub fn extract_layers(image_data: &ImageData) -> Result<Vec<ImageLayer>> {
     match image_data.layers.len() {
-        0 => Err(ExtractError::LayerError),
-        _ => Ok(image_data.layers.clone())
+        0 => Err(Error::LayerError),
+        _ => Ok(image_data.layers.clone()),
     }
 }
 
@@ -81,10 +82,10 @@ pub fn extract_manifest_json(image_data: &ImageData) -> Result<String> {
     match &image_data.manifest {
         Some(image_manifest) => {
             let manifest_str = serde_json::to_string(&image_manifest)
-                .map_err(|err| ExtractError::ManifestError)?;
+                .map_err(|err| Error::ManifestError)?;
             Ok(manifest_str)
         }
-        None => Err(ExtractError::ManifestError)
+        None => Err(Error::ManifestError),
     }
 }
 
@@ -92,69 +93,101 @@ pub fn extract_manifest_json(image_data: &ImageData) -> Result<String> {
 pub fn extract_config_json(image_data: &ImageData) -> Result<String> {
     match String::from_utf8(image_data.config.data.clone()) {
         Ok(config_json) => Ok(config_json),
-        Err(err) => Err(ExtractError::ConfigError(err))
+        Err(err) => Err(Error::ConfigError(err)),
     }
 }
 
 /// Extract the ENV expressions from an image
 pub fn extract_env_expressions(image_data: &ImageData) -> Result<Vec<String>> {
-    let config_string = String::from_utf8(image_data.config.data.clone())
-        .map_err(|err| ExtractError::EnvError(format!(
-            "Failed to extract 'ENV' expressions: {:?}", err)))?;
+    let config_string = String::from_utf8(image_data.config.data.clone()).map_err(|err| {
+        Error::EnvError(format!("Failed to extract 'ENV' expressions: {:?}", err))
+    })?;
 
-    let json_object: Value = serde_json::from_str(config_string.as_str()).map_err(|err|
-        ExtractError::EnvError(format!("Failed to extract ENV expressions from image: {:?}", err)))?;
+    let json_object: Value = serde_json::from_str(config_string.as_str()).map_err(|err| {
+        Error::EnvError(format!(
+            "Failed to extract ENV expressions from image: {:?}",
+            err
+        ))
+    })?;
 
     // Try to parse the config JSON for the 'Env' field
     match json_object
         .get("container_config")
-            .ok_or_else(|| ExtractError::EnvError("'container_config' field is missing in the config JSON.".to_string()))?
+        .ok_or_else(|| {
+            Error::EnvError(
+                "'container_config' field is missing in the config JSON.".to_string(),
+            )
+        })?
         .get("Env")
-            .ok_or_else(|| ExtractError::EnvError("'Env' field is missing in the configuration JSON.".to_string()))?
+        .ok_or_else(|| {
+            Error::EnvError("'Env' field is missing in the configuration JSON.".to_string())
+        })?
         // Try to extract the array of ENV expressions
-        .as_array() {
-            None => Err(ExtractError::EnvError("Failed to extract ENV expressions from image.".to_string())),
-            Some(env_array) => {
-                let env_strings: Vec<String> = env_array.iter().map(|json_value| {
+        .as_array()
+    {
+        None => Err(Error::EnvError(
+            "Failed to extract ENV expressions from image.".to_string(),
+        )),
+        Some(env_array) => {
+            let env_strings: Vec<String> = env_array
+                .iter()
+                .map(|json_value| {
                     let mut string = json_value.to_string();
                     // Remove the quotes from the beginning and the end of the expression
                     string.pop();
                     string.remove(0);
                     string
-                }).collect();
-                Ok(env_strings)
-            }
+                })
+                .collect();
+            Ok(env_strings)
+        }
     }
 }
 
 /// Extract the CMD expressions from an image
 pub fn extract_cmd_expressions(image_data: &ImageData) -> Result<Vec<String>> {
-    let config_string = String::from_utf8(image_data.config.data.clone())
-        .map_err(|err| ExtractError::CmdError(format!(
-            "Failed to extract 'CMD' expressions: {:?}", err)))?;
+    let config_string = String::from_utf8(image_data.config.data.clone()).map_err(|err| {
+        Error::CmdError(format!("Failed to extract 'CMD' expressions: {:?}", err))
+    })?;
 
-    let json_object: Value = serde_json::from_str(config_string.as_str()).map_err(|err|
-        ExtractError::CmdError(format!("Failed to extract CMD expressions from an image: {:?}", err)))?;
+    let json_object: Value = serde_json::from_str(config_string.as_str()).map_err(|err| {
+        Error::CmdError(format!(
+            "Failed to extract CMD expressions from an image: {:?}",
+            err
+        ))
+    })?;
 
     // Try to parse the config JSON for the 'Cmd' field
     match json_object
         .get("container_config")
-            .ok_or_else(|| ExtractError::CmdError("'container_config' field is missing in the config JSON.".to_string()))?
+        .ok_or_else(|| {
+            Error::CmdError(
+                "'container_config' field is missing in the config JSON.".to_string(),
+            )
+        })?
         .get("Cmd")
-            .ok_or_else(|| ExtractError::CmdError("'Cmd' field is missing in the configuration JSON.".to_string()))?
+        .ok_or_else(|| {
+            Error::CmdError("'Cmd' field is missing in the configuration JSON.".to_string())
+        })?
         // Try to extract the array of CMD expressions
-        .as_array() {
-            None => Err(ExtractError::CmdError("Failed to extract CMD expressions from image.".to_string())),
-            Some(cmd_array) => {
-                let cmd_strings: Vec<String> = cmd_array.iter().map(|json_value| {
+        .as_array()
+    {
+        None => Err(Error::CmdError(
+            "Failed to extract CMD expressions from image.".to_string(),
+        )),
+        Some(cmd_array) => {
+            let cmd_strings: Vec<String> = cmd_array
+                .iter()
+                .map(|json_value| {
                     let mut string = json_value.to_string();
                     // Remove the quotes from the beginning and the end of the expression
                     string.pop();
                     string.remove(0);
                     string
-                }).collect();
-                Ok(cmd_strings)
-            }
+                })
+                .collect();
+            Ok(cmd_strings)
+        }
     }
 }
 
@@ -162,21 +195,21 @@ pub fn extract_cmd_expressions(image_data: &ImageData) -> Result<Vec<String>> {
 pub fn extract_image_hash(image_data: &ImageData) -> Result<String> {
     // Extract the config JSON from the image
     let config_json = extract_config_json(image_data)
-        .map_err(|err| ExtractError::ImageHashError(Some(err.to_string())))?;
+        .map_err(|err| Error::ImageHashError(Some(err.to_string())))?;
 
     // Try to parse the config JSON for the image hash
-    let json_object: Value = serde_json::from_str(config_json.as_str()).map_err(|err|
-        ExtractError::ImageHashError(Some(err.to_string())))?;
+    let json_object: Value = serde_json::from_str(config_json.as_str())
+        .map_err(|err| Error::ImageHashError(Some(err.to_string())))?;
 
     let img_hash = json_object
         .get("config")
-            .ok_or_else(|| ExtractError::ImageHashError(None))?
+        .ok_or_else(|| Error::ImageHashError(None))?
         .get("Image")
-            .ok_or_else(|| ExtractError::ImageHashError(None))?
+        .ok_or_else(|| Error::ImageHashError(None))?
         .as_str()
-            .ok_or_else(|| ExtractError::ImageHashError(None))?
+        .ok_or_else(|| Error::ImageHashError(None))?
         .strip_prefix("sha256:")
-        .ok_or_else(|| ExtractError::ImageHashError(None))?
+        .ok_or_else(|| Error::ImageHashError(None))?
         .to_string();
 
     Ok(img_hash)
@@ -285,20 +318,16 @@ mod tests {
     "##;
 
     /// ENV expressions from the hello-world image
-    const TEST_ENV_EXPRESSIONS: [&'static str; 1] = [
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    ];
+    const TEST_ENV_EXPRESSIONS: [&'static str; 1] =
+        ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
 
     /// CMD expressions from the hello-world image
-    const TEST_CMD_EXPRESSIONS: [&'static str; 4] = [
-        "/bin/sh",
-        "-c",
-        "#(nop)",
-        "CMD[\\\"/hello\\\"]"
-    ];
+    const TEST_CMD_EXPRESSIONS: [&'static str; 4] =
+        ["/bin/sh", "-c", "#(nop)", "CMD[\\\"/hello\\\"]"];
 
     /// Image hash (digest) of the hello-world image
-    const TEST_IMAGE_HASH: &str = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d";
+    const TEST_IMAGE_HASH: &str =
+        "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d";
 
     /// Mock array of bytes used for testing representing an image layer
     const TEST_IMAGE_LAYER_BYTES: [u8; 100] = [0u8; 100];
@@ -306,35 +335,27 @@ mod tests {
     /// Builds a mock ImageData struct used for testing the extraction functions
     fn build_image_data() -> ImageData {
         // Use mock image layer bytes
-        let image_layer_bytes= TEST_IMAGE_LAYER_BYTES.to_vec();
-        let layer_obj = ImageLayer::new(
-            image_layer_bytes,
-            "".to_string(),
-            None
-        );
+        let image_layer_bytes = TEST_IMAGE_LAYER_BYTES.to_vec();
+        let layer_obj = ImageLayer::new(image_layer_bytes, "".to_string(), None);
 
         // Use the config.json for testing
         let mut config_json = TEST_CONFIG.to_string();
         config_json = config_json.replace("\n", "");
         config_json = config_json.replace(" ", "");
-        let config_obj = Config::new(
-            config_json.as_bytes().to_vec(),
-            "".to_string(),
-            None,
-        );
+        let config_obj = Config::new(config_json.as_bytes().to_vec(), "".to_string(), None);
 
         // Use the test manifest JSON
         let mut manifest_json = TEST_MANIFEST.to_string();
         manifest_json = manifest_json.replace("\n", "");
         manifest_json = manifest_json.replace(" ", "");
-        let manifest_obj: OciImageManifest = serde_json::from_str(&manifest_json)
-            .expect("Manifest JSON parsing error.");
+        let manifest_obj: OciImageManifest =
+            serde_json::from_str(&manifest_json).expect("Manifest JSON parsing error.");
 
         let image_data = ImageData {
             layers: vec![layer_obj],
             digest: None,
             config: config_obj,
-            manifest: Some(manifest_obj)
+            manifest: Some(manifest_obj),
         };
 
         image_data
@@ -346,8 +367,8 @@ mod tests {
 
         let test_layer_bytes = TEST_IMAGE_LAYER_BYTES.to_vec();
 
-        let extracted_layers = extract_layers(&test_image_data)
-            .expect("Failed to extract image layers");
+        let extracted_layers =
+            extract_layers(&test_image_data).expect("Failed to extract image layers");
 
         // The hello-world image has only one layer, so get the first one (on index 0)
         assert_eq!(test_layer_bytes, extracted_layers.get(0).unwrap().data);
@@ -361,9 +382,9 @@ mod tests {
         test_manifest = test_manifest.replace("\n", "");
         test_manifest = test_manifest.replace(" ", "");
 
-        let extracted_manifest = extract_manifest_json(&test_image_data)
-            .expect("Failed to extract image manifest");
-        
+        let extracted_manifest =
+            extract_manifest_json(&test_image_data).expect("Failed to extract image manifest");
+
         assert_eq!(test_manifest, extracted_manifest);
     }
 
@@ -375,8 +396,8 @@ mod tests {
         test_config = test_config.replace("\n", "");
         test_config = test_config.replace(" ", "");
 
-        let extracted_config = extract_config_json(&test_image_data)
-            .expect("Failed to extract image config.");
+        let extracted_config =
+            extract_config_json(&test_image_data).expect("Failed to extract image config.");
 
         assert_eq!(test_config, extracted_config);
     }
@@ -390,8 +411,8 @@ mod tests {
             .map(|str| str.to_string())
             .collect();
 
-        let extracted_env_expressions = extract_env_expressions(&test_image_data)
-            .expect("Failed to extract ENV expressions.");
+        let extracted_env_expressions =
+            extract_env_expressions(&test_image_data).expect("Failed to extract ENV expressions.");
 
         assert_eq!(test_env_expressions, extracted_env_expressions);
     }
@@ -405,8 +426,8 @@ mod tests {
             .map(|str| str.to_string())
             .collect();
 
-        let extracted_cmd_expressions = extract_cmd_expressions(&test_image_data)
-            .expect("Failed to extract CMD expressions");
+        let extracted_cmd_expressions =
+            extract_cmd_expressions(&test_image_data).expect("Failed to extract CMD expressions");
 
         assert_eq!(test_cmd_expressions, extracted_cmd_expressions);
     }
@@ -417,8 +438,8 @@ mod tests {
 
         let test_image_hash = TEST_IMAGE_HASH.to_string();
 
-        let extracted_image_hash = extract_image_hash(&test_image_data)
-            .expect("Failed to extract image hash.");
+        let extracted_image_hash =
+            extract_image_hash(&test_image_data).expect("Failed to extract image hash.");
 
         assert_eq!(test_image_hash, extracted_image_hash);
     }

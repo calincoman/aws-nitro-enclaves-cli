@@ -7,12 +7,11 @@ use std::fs::OpenOptions;
 use aws_nitro_enclaves_image_format::generate_build_info;
 use enclave_build::Docker2Eif;
 
-mod constants;
-mod cache_manager;
 mod cache;
 mod extract;
 mod pull;
 mod image;
+mod image_manager;
 
 fn main() {
     let matches = App::new("Docker2Eif builder")

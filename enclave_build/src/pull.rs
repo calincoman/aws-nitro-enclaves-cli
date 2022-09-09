@@ -9,7 +9,12 @@ use oci_distribution::{
     secrets::RegistryAuth,
 };
 
-use crate::{constants, image::Image};
+use crate::{image::Image};
+
+pub const ACCEPTED_MEDIA_TYPES: [&'static str; 2] = [
+    oci_distribution::manifest::WASM_LAYER_MEDIA_TYPE,
+    oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
+];
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -52,7 +57,7 @@ pub fn build_client(protocol: ClientProtocol) -> Client {
 }
 
 /// Returns the docker config file by searching first at the path pointed by DOCKER_CONFIG,
-/// and if this env is not set, at {HOME}/.docker/config.json
+/// and if this env is not set, at {HOME}/.docker/config.json.
 fn get_docker_config_file() -> Result<File> {
     // First check the DOCKER_CONFIG env variable for the path to the docker config file
     if let Ok(file) = std::env::var("DOCKER_CONFIG") {
@@ -89,7 +94,7 @@ fn get_docker_config_file() -> Result<File> {
     }
 }
 
-/// Returns the Docker credentials by reading from the Docker config.json file
+/// Returns the Docker credentials by reading from the Docker config.json file.
 ///
 /// The assumed format of the file is:\
 /// {\
@@ -163,8 +168,10 @@ pub fn docker_auth() -> RegistryAuth {
     }
 }
 
-/// Pulls an image (all blobs - layers, manifest and config) from the Docker remote registry
-pub async fn pull_image_data(image_name: &String) -> Result<ImageData> {
+/// Pulls an image (all blobs - layers, manifest and config) from the Docker remote registry.
+/// 
+/// The function takes as argument the image name (e.g. hello-world, postgres, ubuntu etc.)
+pub async fn pull_image_data<S: AsRef<str>>(image_name: S) -> Result<ImageData> {
     // Build the client required for the pulling - uses HTTPS protocol
     let mut client = build_client(ClientProtocol::Https);
 
@@ -177,7 +184,7 @@ pub async fn pull_image_data(image_name: &String) -> Result<ImageData> {
 
     // Pull an ImageData struct containing the layers, manifest and configuration file
     let image_data = client
-        .pull(&image_ref, &auth, constants::ACCEPTED_MEDIA_TYPES.to_vec())
+        .pull(&image_ref, &auth, ACCEPTED_MEDIA_TYPES.to_vec())
         .await;
 
     match image_data {
@@ -186,7 +193,7 @@ pub async fn pull_image_data(image_name: &String) -> Result<ImageData> {
     }
 }
 
-/// Pulls from remote only the manifest digest
+/// Pulls from remote only the manifest digest.
 pub async fn fetch_manifest_digest(image_name: &String) -> Result<String> {
     // Build the client required for the pulling - uses HTTPS protocol
     let mut client = build_client(ClientProtocol::Https);
