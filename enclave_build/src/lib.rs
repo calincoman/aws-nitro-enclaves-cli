@@ -275,13 +275,15 @@ impl<'a> Docker2Eif<'a> {
             _ => return Err(Docker2EifError::UnsupportedArchError),
         };
 
+        let eif_info = self.generate_identity_info()?;
+
         let mut build = EifBuilder::new(
             Path::new(&self.kernel_img_path),
             self.cmdline.clone(),
             self.sign_info.clone(),
             sha2::Sha384::new(),
             flags,
-            self.generate_identity_info()?,
+            eif_info,
         );
 
         // Linuxkit adds -initrd.img sufix to the file names.
