@@ -332,8 +332,8 @@ mod tests {
     /// Mock array of bytes used for testing representing an image layer
     const TEST_IMAGE_LAYER_BYTES: [u8; 100] = [0u8; 100];
 
-    /// Builds a mock ImageData struct used for testing the extraction functions
-    fn build_image_data() -> ImageData {
+    /// Builds a mock ImageData struct
+    pub fn build_image_data() -> ImageData {
         // Use mock image layer bytes
         let image_layer_bytes = TEST_IMAGE_LAYER_BYTES.to_vec();
         let layer_obj = ImageLayer::new(image_layer_bytes, "".to_string(), None);

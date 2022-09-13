@@ -43,7 +43,7 @@ pub struct ImageCacheFetch {
     hash: String,
 
     /// The image layers are an array of raw byte arrays
-    layers: Vec<Vec<u8>>,
+    layers: Option<Vec<Vec<u8>>>,
 
     /// The image manifest, represented as a JSON string
     manifest: String,
@@ -55,7 +55,7 @@ pub struct ImageCacheFetch {
 impl ImageCacheFetch {
     pub fn new<S: AsRef<str>>(
         image_hash: S,
-        layers: Vec<Vec<u8>>,
+        layers: Option<Vec<Vec<u8>>>,
         manifest: String,
         config: String
     ) -> Self {
@@ -65,6 +65,10 @@ impl ImageCacheFetch {
             manifest,
             config
         }
+    }
+
+    pub fn config(&self) -> &String {
+        &self.config
     }
 
     pub fn from(image_data: oci_distribution::client::ImageData) -> Result<Self> {
@@ -82,7 +86,7 @@ impl ImageCacheFetch {
         Ok(
             Self {
                 hash: image_hash,
-                layers: layers,
+                layers: Some(layers),
                 manifest: pulled_manifest,
                 config: pulled_config
             }
@@ -343,4 +347,44 @@ pub struct Platform {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     variant: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ShipliftImageDetails {
+    pub architecture: String,
+    pub author: String,
+    pub comment: String,
+    pub config: ShipliftConfig,
+    pub created: String,
+    pub docker_version: String,
+    pub id: String,
+    pub os: String,
+    pub parent: String,
+    pub repo_tags: Option<Vec<String>>,
+    pub repo_digests: Option<Vec<String>>,
+    pub size: u64,
+    pub virtual_size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ShipliftConfig {
+    pub attach_stderr: bool,
+    pub attach_stdin: bool,
+    pub attach_stdout: bool,
+    pub cmd: Option<Vec<String>>,
+    pub domainname: String,
+    pub entrypoint: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub exposed_ports: Option<HashMap<String, HashMap<String, String>>>,
+    pub hostname: String,
+    pub image: String,
+    pub labels: Option<HashMap<String, String>>,
+    pub on_build: Option<Vec<String>>,
+    pub open_stdin: bool,
+    pub stdin_once: bool,
+    pub tty: bool,
+    pub user: String,
+    pub working_dir: String,
 }

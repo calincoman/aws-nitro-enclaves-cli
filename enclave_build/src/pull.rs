@@ -11,12 +11,7 @@ use oci_distribution::{
 
 use crate::{image::Image};
 
-pub const ACCEPTED_MEDIA_TYPES: [&'static str; 2] = [
-    oci_distribution::manifest::WASM_LAYER_MEDIA_TYPE,
-    oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
-];
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     ImageError(String),
     ManifestDigestError(String),
@@ -42,6 +37,11 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub const ACCEPTED_MEDIA_TYPES: [&'static str; 2] = [
+    oci_distribution::manifest::WASM_LAYER_MEDIA_TYPE,
+    oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
+];
 
 /// Builds a client which uses the protocol given as parameter.
 ///

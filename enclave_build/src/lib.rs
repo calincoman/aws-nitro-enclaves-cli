@@ -8,6 +8,11 @@ use std::process::Command;
 
 mod docker;
 mod yaml_generator;
+mod cache;
+mod extract;
+mod image;
+mod pull;
+mod image_manager;
 
 use aws_nitro_enclaves_image_format::defs::{EifBuildInfo, EifIdentityInfo, EIF_HDR_ARCH_ARM64};
 use aws_nitro_enclaves_image_format::utils::identity::parse_custom_metadata;
@@ -121,7 +126,7 @@ impl<'a> Docker2Eif<'a> {
         })
     }
 
-    pub fn pull_docker_image(&self) -> Result<(), Docker2EifError> {
+    pub fn pull_docker_image(&mut self) -> Result<(), Docker2EifError> {
         self.docker.pull_image().map_err(|e| {
             eprintln!("Docker error: {:?}", e);
             Docker2EifError::DockerError
@@ -142,7 +147,7 @@ impl<'a> Docker2Eif<'a> {
         Ok(())
     }
 
-    fn generate_identity_info(&self) -> Result<EifIdentityInfo, Docker2EifError> {
+    fn generate_identity_info(&mut self) -> Result<EifIdentityInfo, Docker2EifError> {
         let docker_info = self.docker.inspect_image().map_err(|e| {
             Docker2EifError::MetadataError(format!("Docker inspect error: {:?}", e))
         })?;

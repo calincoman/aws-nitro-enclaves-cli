@@ -36,11 +36,11 @@ pub const SHA256_HASH_LEN: u64 = 64;
 /// If false, the default path is used
 pub const TEST_MODE_ENABLED: bool = true;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-    ReadWriteError(std::io::Error),
+    ReadWriteError(String),
     /// Serialization/Deserialization error
-    SerdeError(serde_json::Error),
+    SerdeError(String),
     /// Error when creating the cache
     CacheBuildError(String),
     /// Error when storing image data to cache
@@ -57,9 +57,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::ReadWriteError(err) => write!(f, "Read/Write error: {:?}", err),
-            Error::SerdeError(err) => {
-                write!(f, "Serialization/Deserialization error: {:?}", err)
+            Error::ReadWriteError(msg) => write!(f, "Read/Write error: {}", msg),
+            Error::SerdeError(msg) => {
+                write!(f, "Serialization/Deserialization error: {}", msg)
             },
             Error::CacheBuildError(msg) => write!(f, "Failed to build cache: {}", msg),
             Error::CacheFetchError(msg) => write!(f, "Failed to fetch image from cache: {}", msg),
@@ -139,15 +139,17 @@ impl CacheManager {
 
         // Create the folder where the image data will be stored
         let target_path = self.root_path.clone().join(&image_hash);
-        fs::create_dir(&target_path).map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?;
+        fs::create_dir_all(&target_path).map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?;
 
         // Create the 'layers' folder and store the layers in it
         let layers_path = target_path.clone().join(CACHE_LAYERS_FOLDER_NAME);
+        fs::create_dir_all(&layers_path).map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?;
+
         let layers = extract::extract_layers(&image_data)
             .map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?;
         for layer in layers {
             // Each layer file will be named after the layer's digest hash
-            let layer_file_path = layers_path.join(layer.sha256_digest());
+            let layer_file_path = layers_path.join(format!("{:x}", sha2::Sha256::digest(&layer.data)));
             File::create(&layer_file_path).map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?
                 .write_all(&layer.data).map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?;
         }
@@ -155,6 +157,7 @@ impl CacheManager {
         // Store the manifest
         let manifest_json = extract::extract_manifest_json(&image_data)
             .map_err(|err| Error::CacheStoreError(format!("{:?}", err)))?;
+
         File::create(&target_path.join(CACHE_MANIFEST_FILE_NAME)).map_err(|err|
             Error::CacheStoreError(format!("{:?}", err)))?
             .write_all(manifest_json.as_bytes())
@@ -190,19 +193,54 @@ impl CacheManager {
     /// Fetches the image data from cache as an ImageCacheFetch struct. The image manifest
     /// and config are returned as raw JSON strings.
     /// 
+    /// If the 'with_layers' argument is true, the returning struct also contains the layers, otherwise
+    /// it contains just the image hash, manifest and config.
+    /// 
     /// If the data is not correctly cached or a file is missing, it returns an error.
     /// 
     /// If the image is not cached, it does not attempt to pull the image from remote.
-    pub fn fetch_image<S: AsRef<str>>(&self, image_name: S) -> Result<ImageCacheFetch> {
+    pub fn fetch_image<S: AsRef<str>>(&self, image_name: S, with_layers: bool) -> Result<ImageCacheFetch> {
         // Find the path to the cache folder where the image is stored
         let target_path = self.get_image_folder_path(&image_name)?;
         // Get the hash of the image
         let image_hash = self.get_image_hash_from_name(&image_name)
             .ok_or_else(|| Error::CacheFetchError("Failed to determine image hash.".to_string()))?;
 
-        // Get the image layers from cache
-        let layers = Self::fetch_layers(&target_path)
-            .map_err(|err| Error::CacheFetchError(format!("{:?}", err)))?;
+        // Fetch the manifest JSON string
+        let manifest_json = self.fetch_manifest(&image_name)?;
+
+        // Fetch the config JSON string
+        let config_json = self.fetch_config(&image_name)?;
+        
+        // If the manifest or config JSON strings are empty, return error
+        if manifest_json.is_empty() || config_json.is_empty() {
+            return Err(Error::CacheFetchError("Empty manifest or config file.".to_string()));
+        }
+
+        // Get the image layers from cache (only if 'with_layers' arg is true)
+        let layers_ret = match with_layers {
+            true => {
+                let layers = Self::fetch_layers(&target_path)
+                    .map_err(|err| Error::CacheFetchError(format!("{:?}", err)))?;
+
+                Some(layers)
+            }
+            false => None
+        };
+
+        Ok(
+            ImageCacheFetch::new(
+                image_hash,
+                layers_ret,
+                manifest_json,
+                config_json
+            )
+        )
+    }
+
+    /// Returns the manifest JSON string from the cache.
+    pub fn fetch_manifest<S: AsRef<str>>(&self, image_name: S) -> Result<String> {
+        let target_path = self.get_image_folder_path(&image_name)?;
 
         // Read the JSON string from the manifest file
         let manifest_path = target_path.clone().join(CACHE_MANIFEST_FILE_NAME);
@@ -211,35 +249,13 @@ impl CacheManager {
                 .read_to_string(&mut manifest_json).map_err(|err|
                     Error::CacheFetchError(format!("{:?}", err)))?;
 
-        // Read the JSON string from the config file
-        let config_path = target_path.clone().join(CACHE_CONFIG_FILE_NAME);
-        let mut config_json = String::new();
-        File::open(&config_path).map_err(|err| Error::CacheFetchError(format!("{:?}", err)))?
-            .read_to_string(&mut config_json).map_err(|err|
-                Error::CacheFetchError(format!("{:?}", err)))?;
-        
-        // If the manifest or config JSON strings are empty, return error
-        if manifest_json.is_empty() || config_json.is_empty() {
-            return Err(Error::CacheFetchError("Empty manifest or config file.".to_string()));
-        }
-
-        Ok(
-            ImageCacheFetch::new(
-                image_hash,
-                layers,
-                manifest_json,
-                config_json
-            )
-        )
+        Ok(manifest_json)
     }
 
-    /// Returns the CMD and ENV expressions (in this order) of an image by extracting them
-    /// from the cached image data
-    pub fn fetch_expressions<S: AsRef<str>>(&self, image_name: S) -> Result<(Vec<String>, Vec<String>)> {
+    /// Returns the config JSON string from the cache.
+    pub fn fetch_config<S: AsRef<str>>(&self, image_name: S) -> Result<String> {
         let target_path = self.get_image_folder_path(&image_name)?;
 
-        // The ENV and CMD expressions are located in the config file of the image, so fetch it from
-        // the cache
         let mut config_json = String::new();
         File::open(target_path.join(CACHE_CONFIG_FILE_NAME)).map_err(|err|
             Error::CacheFetchError(format!("{:?}", err)))?
@@ -249,14 +265,36 @@ impl CacheManager {
             return Err(Error::CacheFetchError("Config file is empty.".to_string()));
         }
 
-        let env = self.get_expressions(&config_json, "ENV")?;
-        let cmd = self.get_expressions(&config_json, "CMD")?;
-
-        Ok((cmd, env))
+        Ok(config_json)
     }
 
+    // /// Returns the ENV and CMD expressions (in this order) of an image by extracting them
+    // /// from the cached image data.
+    // pub fn fetch_expressions<S: AsRef<str>>(&self, image_name: S) -> Result<(Vec<String>, Vec<String>)> {
+    //     let target_path = self.get_image_folder_path(&image_name)?;
+
+    //     // The ENV and CMD expressions are located in the config file of the image, so fetch it from
+    //     // the cache
+    //     let config_json = self.fetch_config(image_name)?;
+
+    //     let env = self.get_expressions(&config_json, "ENV")?;
+    //     let cmd = self.get_expressions(&config_json, "CMD")?;
+
+    //     Ok((env, cmd))
+    // }
+
+    // /// Returns the entrypoint of an image by extracting it
+    // /// from the cached image data.
+    // pub fn fetch_entrypoint<S: AsRef<str>>(&self, image_name: S) -> Result<Vec<String>> {
+    //     let config_json = self.fetch_config(image_name)?;
+
+    //     let entrypoint = self.get_expressions(&config_json, "ENTRYPOINT")?;
+
+    //     Ok(entrypoint)
+    // }
+
     /// Determines if an image is stored correctly in the cache represented by the current CacheManager object.
-    pub fn is_cached<S: AsRef<str>>(&self, image_name: S) -> Result<()> {
+    pub fn is_cached<S: AsRef<str>>(&self, image_name: S) -> Result<bool> {
         // If the image is not in the index.json file, then it is definitely not cached
         let image_hash = self.get_image_hash_from_name(&image_name);
         if image_hash.is_none() {
@@ -271,14 +309,7 @@ impl CacheManager {
         // Since the struct pulled by the oci_distribution API does not contain the manifest digest,
         // and another HTTP request should be made to get the digest, just check that the manifest file
         // exists and is not empty
-        let manifest_path = image_folder_path.join(CACHE_MANIFEST_FILE_NAME);
-        let mut manifest_str = String::new();
-        File::open(&manifest_path).map_err(|err| Error::ValidateError(format!("{:?}", err)))?
-            .read_to_string(&mut manifest_str).map_err(|err|
-                Error::ValidateError(format!("{:?}", err)))?;
-        if manifest_str.is_empty() {
-            return Err(Error::ValidateError("The manifest file is empty.".to_string()));
-        }
+        let manifest_str = self.fetch_manifest(&image_name)?;
 
         // The manifest is checked, so now validate the layers
         self.validate_layers(
@@ -289,10 +320,7 @@ impl CacheManager {
         // Finally, check that the config is correctly cached
         // This is done by applying a hash function on the config file contents and comparing the
         // result with the config digest from the manifest
-        let config_path = image_folder_path.join(CACHE_CONFIG_FILE_NAME);
-        let mut config_str = String::new();
-        File::open(&config_path).map_err(|err| Error::ValidateError(format!("{:?}", err)))?
-            .read_to_string(&mut config_str).map_err(|err| Error::ValidateError(format!("{:?}", err)))?;
+        let config_str = self.fetch_config(&image_name)?;
         
         let manifest_obj: serde_json::Value = serde_json::from_str(manifest_str.as_str())
             .map_err(|_| Error::ValidateError("Could not parse manifest JSON.".to_string()))?;
@@ -313,7 +341,7 @@ impl CacheManager {
             return Err(Error::ValidateError("Config content digest and manifest digest do not match".to_string()));
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Validates that the image layers are cached correctly by checking them with the layer descriptors
@@ -388,9 +416,9 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Extracts the specified expressions ("ENV" or "CMD") from the config JSON
+    /// Extracts the specified expressions ("ENV", "CMD" or "ENTRYPOINT") from the config JSON
     /// string given as parameter
-    fn get_expressions<S: AsRef<str>, T: AsRef<str>>(&self, config_json: S, expr: T) -> Result<Vec<String>> {
+    pub fn get_expressions<S: AsRef<str>, T: AsRef<str>>(config_json: S, expr: T) -> Result<Vec<String>> {
         // Deserialize the config string into a JSON Value
         let config: serde_json::Value = serde_json::from_str(config_json.as_ref()).map_err(|err| {
             Error::CacheFetchError(format!(
@@ -402,6 +430,7 @@ impl CacheManager {
         let field = match expr.as_ref().to_string().as_str() {
             "ENV" => "Env",
             "CMD" => "Cmd",
+            "ENTRYPOINT" => "Entrypoint",
             &_ => ""
         };
 
@@ -420,9 +449,7 @@ impl CacheManager {
             // Try to extract the array of expressions
             .as_array()
         {
-            None => Err(Error::CacheFetchError(
-                format!("Failed to extract {} expressions from image.", expr.as_ref().to_string()),
-            )),
+            None => Ok(Vec::new()),
             Some(array) => {
                 let strings: Vec<String> = array
                     .iter()
@@ -441,13 +468,37 @@ impl CacheManager {
         array
     }
 
+    /// Extracts the value matching the field given as argument from the config JSON
+    /// string given as parameter.
+    pub fn get_from_config_json<S: AsRef<str>, T: AsRef<str>>(config_json: S, field: T) -> Result<String> {
+        // Deserialize the config string into a JSON Value
+        let config: serde_json::Value = serde_json::from_str(config_json.as_ref()).map_err(|err| {
+            Error::CacheFetchError(format!(
+                "Deserialization error: {:?}",
+                err
+            ))
+        })?;
+
+        // Parse the architecture
+        let arch = config
+            .get(field.as_ref().to_string().as_str())
+            .ok_or_else(|| Error::CacheFetchError(
+                format!("{} field is missing from config JSON.", field.as_ref().to_string())
+            ))?
+            .to_string();
+
+        Ok(arch)
+    }
+
     /// Returns the default root folder path of the cache.
     /// 
-    /// If the TEST_MODE_ENABLED constant is set to true, ./cache/
-    /// is used as cache root.
-    pub fn get_default_cache_root_path() -> Result<PathBuf> {
+    /// If the "test" argument is true, ./cache/ is used as cache root.
+    /// 
+    /// The default cache path is {XDG_DATA_HOME}/.nitro_cli/container_cache, and if the env
+    /// variable is not set, {HOME}/.local/share/.nitro_cli/container_cache is used.
+    pub fn get_default_cache_root_path(test: bool) -> Result<PathBuf> {
         // For testing, the cache will be saved to the local directory
-        if TEST_MODE_ENABLED {
+        if test {
             let mut local_path = std::env::current_dir().unwrap();
             local_path.push("cache");
             return Ok(local_path);
@@ -586,7 +637,6 @@ impl CacheManager {
             .into_iter()
             .map(|file| file.unwrap());
 
-
         let mut layers = Vec::new();
 
         // Iterate through the layer files
@@ -611,14 +661,20 @@ impl CacheManager {
 fn deserialize_from_file<P: AsRef<Path>, T: DeserializeOwned>(path: P) -> Result<T> {
     let path = path.as_ref();
     let manifest_file =
-        std::io::BufReader::new(fs::File::open(path).map_err(|err| Error::ReadWriteError(err))?);
-    let manifest = serde_json::from_reader(manifest_file).map_err(|err| Error::SerdeError(err))?;
+        std::io::BufReader::new(fs::File::open(path).map_err(|err| Error::ReadWriteError(
+            format!("{:?}", err)
+        ))?);
+    let manifest = serde_json::from_reader(manifest_file).map_err(|err| Error::SerdeError(
+        format!("{:?}", err)
+    ))?;
 
     Ok(manifest)
 }
 
 fn deserialize_from_reader<R: Read, T: DeserializeOwned>(reader: R) -> Result<T> {
-    let manifest = serde_json::from_reader(reader).map_err(|err| Error::SerdeError(err))?;
+    let manifest = serde_json::from_reader(reader).map_err(|err| Error::SerdeError(
+        format!("{:?}", err)
+    ))?;
 
     Ok(manifest)
 }
@@ -634,13 +690,17 @@ fn serialize_to_file<P: AsRef<Path>, T: Serialize>(
         .create(true)
         .truncate(true)
         .open(path)
-        .map_err(|err| Error::ReadWriteError(err))?;
+        .map_err(|err| Error::ReadWriteError(format!("{:?}", err)))?;
 
     let file = std::io::BufWriter::new(file);
 
     match pretty {
-        true => serde_json::to_writer_pretty(file, object).map_err(|err| Error::SerdeError(err))?,
-        false => serde_json::to_writer(file, object).map_err(|err| Error::SerdeError(err))?,
+        true => serde_json::to_writer_pretty(file, object).map_err(|err| Error::SerdeError(
+            format!("{:?}", err)
+        ))?,
+        false => serde_json::to_writer(file, object).map_err(|err| Error::SerdeError(
+            format!("{:?}", err)
+        ))?,
     };
 
     Ok(())
@@ -653,9 +713,13 @@ fn serialize_to_writer<W: Write, T: Serialize>(
 ) -> Result<()> {
     match pretty {
         true => {
-            serde_json::to_writer_pretty(writer, object).map_err(|err| Error::SerdeError(err))?
+            serde_json::to_writer_pretty(writer, object).map_err(|err| Error::SerdeError(
+                format!("{:?}", err)
+            ))?
         }
-        false => serde_json::to_writer(writer, object).map_err(|err| Error::SerdeError(err))?,
+        false => serde_json::to_writer(writer, object).map_err(|err| Error::SerdeError(
+            format!("{:?}", err)
+        ))?,
     };
 
     Ok(())
@@ -663,7 +727,261 @@ fn serialize_to_writer<W: Write, T: Serialize>(
 
 fn serialize_to_string<T: Serialize>(object: &T, pretty: bool) -> Result<String> {
     Ok(match pretty {
-        true => serde_json::to_string_pretty(object).map_err(|err| Error::SerdeError(err))?,
-        false => serde_json::to_string(object).map_err(|err| Error::SerdeError(err))?,
+        true => serde_json::to_string_pretty(object).map_err(|err| Error::SerdeError(
+            format!("{:?}", err)
+        ))?,
+        false => serde_json::to_string(object).map_err(|err| Error::SerdeError(
+            format!("{:?}", err)
+        ))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    pub enum TestError {
+        ImageCacheError(String),
+        ImagePullError(String),
+    }
+
+    pub type TestResult<T> = std::result::Result<T, TestError>;
+
+    /// Name of the image to be pulled and cached.
+    const TEST_IMAGE_NAME: &str = "hello-world";
+
+    #[tokio::test]
+    async fn setup_test_cache() -> TestResult<()> {
+        // Name of the image to be used for testing
+        let image_name = TEST_IMAGE_NAME.to_string();
+
+        let image_data = crate::pull::pull_image_data(&image_name)
+            .await
+            .map_err(|err| TestError::ImagePullError(format!("{:?}", err)))?;
+
+        let cache_root_path = CacheManager::get_default_cache_root_path(true)
+            .expect("Failed to get cache root path.");
+
+        let mut cache_manager = CacheManager::new(
+            CacheManager::get_default_cache_root_path(true).unwrap()
+        ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+        cache_manager.store_image(&image_name, &image_data).map_err(|err|
+            TestError::ImageCacheError(format!("{:?}", err))    
+        )?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_image_already_cached() -> TestResult<()> {
+        // Name of the image to be used for testing
+        let image_name = TEST_IMAGE_NAME.to_string();
+
+        let cache_manager = CacheManager::new(
+            CacheManager::get_default_cache_root_path(true).unwrap()
+        ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+        let res = cache_manager.is_cached(&image_name).map_err(|err|
+            TestError::ImageCacheError(format!("{:?}", err)) 
+        )?;
+        assert_eq!(res, true);
+
+        Ok(())
+    } 
+
+    #[test]
+    fn test_is_cached() -> TestResult<()> {
+        // Name of the image to be used for testing
+        let image_name = TEST_IMAGE_NAME.to_string();
+
+        let cache_manager = CacheManager::new(
+            CacheManager::get_default_cache_root_path(true).unwrap()
+        ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+        let res = cache_manager.is_cached(&image_name).map_err(|err|
+            TestError::ImageCacheError(format!("{:?}", err)) 
+        )?;
+        assert_eq!(res, true);
+
+        Ok(())
+    }
+
+    use serde_json::from_value;
+    use shiplift::rep::Config;
+    #[test]
+    fn test_config_shiplift() -> TestResult<()> {
+
+        // Name of the image to be used for testing
+        let image_name = TEST_IMAGE_NAME.to_string();
+
+        let cache_manager = CacheManager::new(
+            CacheManager::get_default_cache_root_path(true).unwrap()
+        ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+        let res = cache_manager.is_cached(&image_name).map_err(|err|
+            TestError::ImageCacheError(format!("{:?}", err)) 
+        )?;
+        assert_eq!(res, true);
+
+        let config_json = cache_manager.fetch_config(&image_name)
+            .expect("fetch config failed.");
+
+        let aux: serde_json::Value = serde_json::from_str(config_json.as_str()).expect("deserialization failed.");
+        let config = aux.get("container_config").expect("err");
+        let config_obj: shiplift::rep::Config = serde_json::from_value(config.clone()).expect("err");
+
+        let mut path = std::env::current_dir().unwrap();
+        path.push("tmp_config.json");
+        serialize_to_file(&path, &config_obj, false).expect("serialize to file failed.");
+
+        Ok(())
+    }
+
+    // #[test]
+    // fn test_validate_layers() {
+    //     let cache_manager = create_test_cache_manager();
+
+    //     let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
+
+    //     let res = cache_manager.validate_layers(&test_image_digest);
+
+    //     assert_eq!(res.is_err(), false);
+    // }
+
+    // #[test]
+    // async fn test_validate_manifest() {
+        
+    // }
+
+    // #[test]
+    // fn test_validate_config() {
+    //     let cache_manager = create_test_cache_manager();
+
+    //     let test_image_digest = "b9935d4e8431fb1a7f0989304ec86b3329a99a25f5efdc7f09f3f8c41434ca6d".to_string();
+
+    //     let val = cache_manager.validate_config(&test_image_digest);
+
+    //     assert_eq!(val.is_err(), false);
+    // }
+
+    // #[tokio::test]
+    // async fn test_cached_image() -> Result<(), TestError> {
+    //     let (image, cache_manager) = setup_test().await;
+
+    //     let image_hash = image.get_image_hash().expect("extract image hash");
+    //     let cached_image_bytes = ImageContents::fetch(
+    //         cache_manager.get_image_folder_path(&image_hash)
+    //     ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+    //     let image_bytes = extract::extract_image(image.data()).unwrap();
+    //     assert_eq!(cached_image_bytes, image_bytes);
+
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn test_cached_layers() -> Result<(), TestError> {
+    //     let (image, cache_manager) = setup_test().await;
+
+    //     let image_hash = image.get_image_hash().expect("extract image hash");
+    //     let cached_layers = ImageLayers::fetch(
+    //         cache_manager.get_image_folder_path(&image_hash)
+    //     ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+    //     let layers = extract::extract_layers(image.data()).unwrap();
+
+    //     for (cached_layer, layer) in cached_layers.iter().zip(layers.iter()) {
+    //         assert_eq!(*cached_layer, layer.data);
+    //     }
+
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn test_cached_config() -> Result<(), TestError> {
+    //     let (image, cache_manager) = setup_test().await;
+
+    //     let image_hash = image.get_image_hash().expect("extract image hash");
+    //     let cached_config = ImageConfig::fetch(
+    //         cache_manager.get_image_folder_path(&image_hash)
+    //     ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+    //     let config_str = extract::extract_config_json(image.data()).unwrap();
+
+    //     // Create JSON Values from the strings in order to ignore the whitespaces from the cached config file
+    //     let cached_config_val: serde_json::Value = serde_json::from_str(cached_config.as_str())
+    //         .expect("JSON parsing error.");
+    //     let config_val: serde_json::Value = serde_json::from_str(config_str.as_str())
+    //         .expect("JSON parsing error.");
+
+    //     assert_eq!(cached_config_val, config_val);
+
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn test_cached_manifest() -> Result<(), TestError> {
+    //     let (image, cache_manager) = setup_test().await;
+        
+    //     let image_hash = image.get_image_hash().expect("extract image hash");
+    //     let cached_manifest = ImageManifest::fetch(
+    //         cache_manager.get_image_folder_path(&image_hash)
+    //     ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+    //     let manifest_str = extract::extract_manifest_json(image.data()).unwrap();
+
+    //     // Create JSON Values from the strings in order to ignore the whitespaces from the cached manifest file
+    //     let cached_manifest_val: serde_json::Value = serde_json::from_str(cached_manifest.as_str())
+    //         .expect("JSON parsing error.");
+    //     let manifest_val: serde_json::Value = serde_json::from_str(manifest_str.as_str())
+    //         .expect("JSON parsing error.");
+
+    //     assert_eq!(cached_manifest_val, manifest_val);
+
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn test_cached_env_expressions() -> Result<(), TestError> {
+    //     let (image, cache_manager) = setup_test().await;
+
+    //     let image_hash = image.get_image_hash().expect("extract image hash");
+    //     let cached_env_expr = EnvExpressions::fetch(
+    //         cache_manager.get_image_folder_path(&image_hash)
+    //     ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+    //     let env_expr = extract::extract_env_expressions(image.data()).unwrap();
+
+    //     for (cached_expr, expr) in cached_env_expr.iter().zip(env_expr.iter()) {
+    //         assert_eq!(cached_expr, expr);
+    //     }
+
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn test_cached_cmd_expressions() -> Result<(), TestError> {
+    //     let (image, cache_manager) = setup_test().await;
+
+    //     let image_hash = image.get_image_hash().expect("extract image hash");
+    //     let cached_cmd_expr = CmdExpressions::fetch(
+    //         cache_manager.get_image_folder_path(&image_hash)
+    //     ).map_err(|err| TestError::ImageCacheError(format!("{:?}", err)))?;
+
+    //     let cmd_expr = extract::extract_cmd_expressions(image.data()).unwrap();
+
+    //     for (cached_expr, expr) in cached_cmd_expr.iter().zip(cmd_expr.iter()) {
+    //         assert_eq!(cached_expr, expr);
+    //     }
+
+    //     Ok(())
+    // }
+
+    macro_rules! aw {
+        ($e:expr) => {
+            tokio_test::block_on($e)
+        };
+    }
 }
