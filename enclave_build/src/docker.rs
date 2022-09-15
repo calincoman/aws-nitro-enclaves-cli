@@ -20,26 +20,24 @@ use crate::image_manager::ImageManager;
 pub const DOCKER_ARCH_ARM64: &str = "arm64";
 pub const DOCKER_ARCH_AMD64: &str = "amd64";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum DockerError {
     BuildError,
     InspectError,
     RuntimeError,
     TempfileError,
     UnsupportedEntryPoint,
+    /// Error coming from the image manager
     ImageManagerError(crate::image_manager::Error),
-    CacheError(crate::cache::Error)
+    /// The image configuration could not be found
+    ImageConfigMissing,
+    /// The cache root path could not be determined
+    CacheRootPath(String)
 }
 
 impl From<crate::image_manager::Error> for DockerError {
     fn from(err: crate::image_manager::Error) -> Self {
         DockerError::ImageManagerError(err)
-    }
-}
-
-impl From<crate::cache::Error> for DockerError {
-    fn from(err: crate::cache::Error) -> Self {
-        DockerError::CacheError(err)
     }
 }
 
@@ -180,12 +178,14 @@ impl DockerUtil {
     //     }
     // }
 
-    /// Pull the image, with the tag provided in constructor, from the Docker registry and
+    /// Pull the image, with the tag provided in constructor, from the remote registry and
     /// store it in the local cache
     pub fn pull_image(&mut self) -> Result<(), DockerError> {
         // Initialize the cache using the default cache path
-        let def_root_path = crate::cache::CacheManager::get_default_cache_root_path(false)?;
+        let def_root_path = crate::cache::CacheManager::get_default_cache_root_path(true)
+            .map_err(|err| DockerError::CacheRootPath(format!("{:?}", err)))?;
         self.image_manager.add_cache(&def_root_path)?;
+        println!("Image cache created at: {}", def_root_path.to_str().unwrap_or("Path print error."));
         
         let act = async {
             // Remove the tag suffix
@@ -339,37 +339,41 @@ impl DockerUtil {
         // Remove the tag suffix
         let image_name = self.docker_image.strip_suffix(":latest").unwrap().to_string();
 
-        let act = async {
-            match self.image_manager_mut().get_expressions(&image_name).await {
-                Ok((env_expr, cmd_expr, entry_expr)) =>
-                    Ok((env_expr, cmd_expr, entry_expr)),
-                Err(err) => {
-                    error!("{:?}", err);
-                    Err(DockerError::InspectError)
-                }
-            }
+        // Try to get the image
+        let act_get_image = async {
+            self.image_manager_mut().get_image(&image_name, false).await
         };
-        
-        let check_runtime = Runtime::new()
-            .map_err(|_| DockerError::RuntimeError)?
-            .block_on(act);
-
-        if check_runtime.is_err() {
-            return Err(DockerError::InspectError);
+        let check_get_image = Runtime::new().map_err(|_| DockerError::RuntimeError)?
+            .block_on(act_get_image);
+        if check_get_image.is_err() {
+            return Err(DockerError::ImageManagerError(check_get_image.err().unwrap()));
         }
-        let env = check_runtime.as_ref().unwrap().0.clone();
-        let cmd = check_runtime.as_ref().unwrap().1.clone();
-        let entrypoint = check_runtime.as_ref().unwrap().2.clone();
+        let image = check_get_image.unwrap();
+        // Check if the image config exists
+        if image.config().config().is_none() {
+            return Err(DockerError::ImageConfigMissing);
+        }
+
+        // Get the expressions from the image
+        let cmd = image.config().config().as_ref().unwrap().cmd();
+        let env = image.config().config().as_ref().unwrap().env();
+        let entrypoint = image.config().config().as_ref().unwrap().entrypoint();
 
         // If no CMD instructions are found, try to locate an ENTRYPOINT command
-        if cmd.is_empty() || env.is_empty() {
-            if entrypoint.is_empty() {
+        if cmd.is_none() || env.is_none() {
+            if entrypoint.is_none() {
                 return Err(DockerError::UnsupportedEntryPoint);
             }
-            return Ok((cmd, env));
+            return Ok((
+                entrypoint.as_ref().unwrap().to_vec(),
+                env.as_ref().ok_or_else(Vec::<String>::new).unwrap().to_vec()
+            ));
         }
-        
-        Ok((cmd, env))
+
+        Ok((
+            cmd.as_ref().unwrap().to_vec(),
+            env.as_ref().unwrap().to_vec()
+        ))
     }
 
     // fn extract_image(&self) -> Result<(Vec<String>, Vec<String>), DockerError> {
@@ -470,22 +474,18 @@ impl DockerUtil {
 
     /// Fetch architecture information from an image
     pub fn architecture(&mut self) -> Result<String, DockerError> {
-        let arch = async {
+        let act_get_image = async {
             // Remove the tag suffix
             let image_name = self.docker_image.strip_suffix(":latest").unwrap().to_string();
 
-            match self.image_manager_mut().get_architecture(&image_name).await {
-                Ok(arch) => Ok(arch),
-                Err(err) => {
-                    error!("{:?}", err);
-                    Err(DockerError::InspectError)
-                }
-            }
+            let image = self.image_manager_mut().get_image(&image_name, false).await?;
+
+            Ok(format!("{}", image.config().architecture()))
         };
 
         let runtime = Runtime::new().map_err(|_| DockerError::RuntimeError)?;
 
-        runtime.block_on(arch)
+        runtime.block_on(act_get_image)
     }
 
     // /// Fetch architecture information from an image

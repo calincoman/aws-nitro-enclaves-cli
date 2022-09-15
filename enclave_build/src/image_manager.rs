@@ -1,6 +1,7 @@
 // Copyright 2019-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::convert::TryFrom;
 use std::fmt::write;
 use std::{
     path::Path
@@ -11,25 +12,25 @@ use tokio::runtime::Runtime;
 use serde_json::json;
 
 use crate::cache::CacheManager;
-use crate::image::{self, ImageCacheFetch, ShipliftImageDetails};
+use crate::image::{self, Image, ModelImageDetails, ModelConfig};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Error {
-    ImagePullError(crate::pull::Error),
-    CacheError(crate::cache::Error),
-    ImageRefError,
+    ImagePull(crate::pull::Error),
+    Cache(crate::cache::Error),
+    ImageConvert(crate::image::Error),
     Other(String)
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::ImagePullError(err) =>
+            Error::ImagePull(err) =>
                 write!(f, "Could not pull image data from the remote registry: {:?}", err),
-            Error::CacheError(err) =>
-                write!(f, "{:?}", err),
-            Error::ImageRefError =>
-                write!(f, "Failed to find image reference."),
+            Error::Cache(err) =>
+                write!(f, "Cache error: {:?}", err),
+            Error::ImageConvert(err) =>
+                write!(f, "Image convert error: {:?}", err),
             Error::Other(msg) =>
                 write!(f, "{}", msg)
         }
@@ -38,13 +39,19 @@ impl std::fmt::Display for Error {
 
 impl From<crate::pull::Error> for Error {
     fn from(err: crate::pull::Error) -> Self {
-        Error::ImagePullError(err)
+        Error::ImagePull(err)
     }
 }
 
 impl From<crate::cache::Error> for Error {
     fn from(err: crate::cache::Error) -> Self {
-        Error::CacheError(err)
+        Error::Cache(err)
+    }
+}
+
+impl From<crate::image::Error> for Error {
+    fn from(err: crate::image::Error) -> Self {
+        Error::ImageConvert(err)
     }
 }
 
@@ -93,7 +100,7 @@ impl ImageManager {
     /// it pulls the image, caches it (if the 'cache' field is not None) and returns it.
     /// 
     /// If the pull succedeed but the caching failed, just returns the pulled image.
-    pub async fn get_image<S: AsRef<str>>(&mut self, image_name: S, with_layers: bool) -> Result<ImageCacheFetch> {
+    pub async fn get_image<S: AsRef<str>>(&mut self, image_name: S, with_layers: bool) -> Result<Image> {
         // If a cache was created / added
         if self.cache.is_some() {
             let local_cache = self.cache_mut().unwrap();
@@ -114,122 +121,57 @@ impl ImageManager {
                     println!("Failed to store image to cache: {}", format!("{:?}", res.err().unwrap()));
                 }
 
-                let image = ImageCacheFetch::from(image_data)
-                    .map_err(|err| Error::Other(format!("{:?}", err)))?;
+                let image = Image::try_from(image_data)?;
 
                 // Even if the caching failed, return the image
                 return Ok(image);
             }
         } else {
-            println!("Cache not found in current ImageManager object, pulling and returning image.");
+            println!("Cache not set in current ImageManager object, pulling and returning image.");
             let image_data = crate::pull::pull_image_data(&image_name).await?;
             println!("Image pulled successfully.");
 
-            let image = ImageCacheFetch::from(image_data)
-                    .map_err(|err| Error::Other(format!("{:?}", err)))?;
+            let image = Image::try_from(image_data)?;
 
             return Ok(image);
         }
     }
 
-    /// Attempts to fetch the ENV, CMD and ENTRYPOINT expressions (in this order) from the cached image.
-    /// 
-    /// If the image is not cached, it tries to pull the image, cache it and then return the expressions.
-    /// If caching fails but the pulling was successful, it extracts and returns the expressions from the pulled
-    /// image.
-    pub async fn get_expressions<S: AsRef<str>>(&mut self, image_name: S)
-        -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
-
-            let image = self.get_image(&image_name, false).await?;
-        
-            let config_json = image.config().to_string();
-
-            let env = CacheManager::get_expressions(&config_json, "ENV")?;
-            let cmd = CacheManager::get_expressions(&config_json, "CMD")?;
-            let entrypoint = CacheManager::get_expressions(&config_json, "ENTRYPOINT")?;
-
-            Ok((env, cmd, entrypoint))
-    }
-
-    /// Attempts to fetch the architecture on which the binaries of the image are built to run on
-    /// from the cached image.
-    /// 
-    /// If the image is not cached, it tries to pull the image, cache it and then return the architecture.
-    /// If caching fails but the pulling was successful, it extracts and returns the architecture from the pulled
-    /// image.
-    pub async fn get_architecture<S: AsRef<str>>(&mut self, image_name: S) -> Result<String> {
-        let image = self.get_image(&image_name, false).await?;
-
-        let config_json = image.config().to_string();
-
-        let architecture = CacheManager::get_from_config_json(&config_json, "architecture")?;
-
-        Ok(architecture)
-    }
-
     pub async fn get_image_details<S: AsRef<str>>(&mut self, image_name: S)
     -> Result<serde_json::Value> {
-        let image = self.get_image(&image_name, false).await?;
-        let config_json = image.config().to_string();
+        let mut config_json = String::new();
+        if self.cache.is_some() {
+            if self.cache().unwrap().is_cached(&image_name).is_ok() {
+                config_json = self.cache().unwrap().fetch_config(&image_name)?;
+                println!("Image found in local cache - fetching config.");
+            } else {
+                // The image is not cached, so try to pull and then cache it
+                println!("Image is not cached, attempting to pull it.");
+                let image_data = crate::pull::pull_image_data(&image_name).await?;
+                println!("Image pulled successfully.");
 
-        // Extract the config JSON into the shiplift Config struct
-        let tmp: serde_json::Value = serde_json::from_str(&config_json.as_str())
-            .map_err(|err| Error::Other(format!("{:?}", err)))?;
-        
-        let config_val = tmp.get("container_config")
-            .ok_or_else(|| Error::Other(format!("'container_config' field missing from config JSON.")))?;
+                // Store the image to cache
+                let res = self.cache_mut().unwrap().store_image(&image_name, &image_data);
+                if res.is_err() {
+                    println!("Failed to store image to cache: {}", format!("{:?}", res.err().unwrap()));
+                }
 
-        let config: image::ShipliftConfig = serde_json::from_value(config_val.clone())
-            .map_err(|err| Error::Other(format!("Deserialization failed: {:?}", err)))?;
+                config_json = crate::extract::extract_config_json(&image_data).map_err(|err|
+                    Error::Other(format!("{:?}", err)))?;
+            }
+        } else {
+            println!("Cache not set in current ImageManager object, pulling and returning image.");
+            let image_data = crate::pull::pull_image_data(&image_name).await?;
+            println!("Image pulled successfully.");
 
-        let arch = CacheManager::get_from_config_json(&config_json, "architecture")?;
-        let created = CacheManager::get_from_config_json(&config_json, "created")?;
-        let docker_version = CacheManager::get_from_config_json(&config_json, "docker_version")?;
-        let os = CacheManager::get_from_config_json(&config_json, "os")?;    
+            config_json = crate::extract::extract_config_json(&image_data).map_err(|err|
+                Error::Other(format!("{:?}", err)))?;
+        }
 
-        // The 'id' is the digest of the config string.
-        let id = format!("sha256:{:x}", sha2::Sha256::digest(config_json.as_bytes()));
+        // Deserialize the config JSON String
+        let config: ModelImageDetails = serde_json::from_str(&config_json.as_str())
+            .map_err(|_| Error::Other("Could not serialize the config JSON.".to_string()))?; 
 
-        let image_details = 
-            ShipliftImageDetails {
-                architecture: arch,
-                // not found in pulled config
-                author: "".to_string(),
-                // not found in pulled config
-                comment: "".to_string(),
-                config: config,
-                created: created,
-                docker_version: docker_version,
-                id: id,
-                os: os,
-                // not found in pulled config
-                parent: "".to_string(),
-                repo_tags: None,
-                // not found in pulled config
-                repo_digests: None,
-                // not found in pulled config
-                size: 0,
-                // not found in pulled config
-                virtual_size: 0
-            };
-
-        Ok(json!(image_details))
-       
-        // Kept this comment just as a model
-        // pub struct ShipliftImageDetails {
-        //     pub architecture: String,
-        //     pub author: String,
-        //     pub comment: String,
-        //     pub config: ShipliftConfig,
-        //     pub created: String,
-        //     pub docker_version: String,
-        //     pub id: String,
-        //     pub os: String,
-        //     pub parent: String,
-        //     pub repo_tags: Option<Vec<String>>,
-        //     pub repo_digests: Option<Vec<String>>,
-        //     pub size: u64,
-        //     pub virtual_size: u64,
-        // }
+        Ok(json!(config))
     }
 }

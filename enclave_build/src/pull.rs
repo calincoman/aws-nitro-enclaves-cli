@@ -192,24 +192,3 @@ pub async fn pull_image_data<S: AsRef<str>>(image_name: S) -> Result<ImageData> 
         Err(err) => Err(Error::ImageError(err.to_string())),
     }
 }
-
-/// Pulls from remote only the manifest digest.
-pub async fn fetch_manifest_digest(image_name: &String) -> Result<String> {
-    // Build the client required for the pulling - uses HTTPS protocol
-    let mut client = build_client(ClientProtocol::Https);
-
-    // Try to get the credentials from the Docker config file
-    let auth = docker_auth();
-
-    // Build an image reference from the image name
-    let image_ref = Image::image_reference(image_name)
-        .map_err(|err| Error::ImageError(format!("{:?}", err)))?;
-
-    // Pull the manifest digest from the remote registry
-    let manifest_digest = client
-        .fetch_manifest_digest(&image_ref, &auth)
-        .await
-        .map_err(|err| Error::ManifestDigestError(format!("{:?}", err)))?;
-
-    Ok(manifest_digest)
-}

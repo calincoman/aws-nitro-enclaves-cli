@@ -1,390 +1,239 @@
 // Copyright 2019-2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+    de::{DeserializeOwned}
+};
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    path::Path,
+    io::{Read, BufReader, Write, BufWriter},
+    fs::{OpenOptions, File}
+};
 
-use std::collections::HashMap;
+use crate::{extract};
 
-use crate::extract;
+use oci_spec::image::{ImageConfiguration, ImageManifest};
+use oci_distribution::{
+    Reference,
+    client::ImageData
+};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Error {
-    ImageRefError(oci_distribution::ParseError),
-    ImageBuildError(String),
-    ImageConvertError(extract::Error)
+    ImageRef(oci_distribution::ParseError),
+    ImageConvertExtract(extract::Error),
+    FileIO(std::io::Error),
+    Serde(serde_json::Error)
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::ImageRefError(err) => write!(f, "Conversion failed: {:?}", err),
-            Error::ImageBuildError(msg) => write!(f, "Image struct creation failed: {}", msg),
-            Error::ImageConvertError(err) => write!(f, "Failed to convert from pulled struct: {:?}", err)
+            Error::ImageRef(err) => write!(f, "Failed to find image reference: {:?}", err),
+            Error::ImageConvertExtract(err) => write!(f, "Failed to build Image from pulled struct: {:?}", err),
+            Error::FileIO(err) => write!(f, "File read/write error: {:?}", err),
+            Error::Serde(err) => write!(f, "Serialization/Deserialization error: {:?}", err)
         }
     }
 }
 
 impl From<extract::Error> for Error {
     fn from(err: extract::Error) -> Self {
-        Error::ImageConvertError(err)
+        Error::ImageConvertExtract(err)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Error::Serde(err)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::FileIO(err)
     }
 }
 
 impl std::error::Error for Error {}
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-// #[derive(Clone)]
-/// This struct contains the image data, with the manifest and config as raw JSON strings.
-/// 
-/// This is the struct fetched from the cache, and later deserialized in order to create
-/// an Image struct.
-pub struct ImageCacheFetch {
+#[derive(Clone)]
+/// Struct wrapping all data associated to an image: image layers, config, manifest etc.
+pub struct Image {
+    /// The hash of the image, extracted from the 'Image' field of the image config.json
     hash: String,
-
-    /// The image layers are an array of raw byte arrays
+    /// The layers of the image, stored as an array of bytes
     layers: Option<Vec<Vec<u8>>>,
-
-    /// The image manifest, represented as a JSON string
-    manifest: String,
-
-    /// The image config, represented as a JSON string
-    config: String,
+    /// The image manifest
+    manifest: ImageManifest,
+    /// The image config
+    config: ImageConfiguration,
 }
 
-impl ImageCacheFetch {
+impl Image {
     pub fn new<S: AsRef<str>>(
         image_hash: S,
         layers: Option<Vec<Vec<u8>>>,
-        manifest: String,
-        config: String
+        manifest: ImageManifest,
+        config: ImageConfiguration,
     ) -> Self {
         Self {
             hash: image_hash.as_ref().to_string(),
             layers,
             manifest,
-            config
+            config,
         }
     }
 
-    pub fn config(&self) -> &String {
+    /// Returns the image config.
+    pub fn config(&self) -> &ImageConfiguration {
         &self.config
-    }
-
-    pub fn from(image_data: oci_distribution::client::ImageData) -> Result<Self> {
-        let image_hash = extract::extract_image_hash(&image_data)?;
-
-        let pulled_layers = extract::extract_layers(&image_data)?;
-        let layers: Vec<Vec<u8>> = pulled_layers
-            .into_iter()
-            .map(|layer| layer.data)
-            .collect();
-
-        let pulled_config = extract::extract_config_json(&image_data)?;
-        let pulled_manifest = extract::extract_manifest_json(&image_data)?;
-
-        Ok(
-            Self {
-                hash: image_hash,
-                layers: Some(layers),
-                manifest: pulled_manifest,
-                config: pulled_config
-            }
-        )
-    }
-}
-
-#[derive(Clone)]
-/// Struct wrapping all data associated to an image: image layers, config, manifest etc.
-pub struct Image {
-    /// The simple name of the image, e.g. hello-world, ubuntu etc.
-    name: String,
-    /// The hash of an image, extracted from the 'Image' field of the image config.json
-    hash: String,
-    /// The reference of an image, e.g. "docker.io/library/hello-world:latest" for hello-world image
-    uri: oci_distribution::Reference,
-
-    /// The layers of the image, stored in an array
-    layers: Vec<oci_distribution::client::ImageLayer>,
-    /// The image manifest
-    manifest: ImageManifest,
-    /// The image config
-    config: ImageConfig,
-}
-
-impl Image {
-    pub fn new<S: AsRef<str>>(
-        image_name: S,
-        layers: Vec<oci_distribution::client::ImageLayer>,
-        manifest: ImageManifest,
-        config: ImageConfig,
-    ) -> Result<Self> {
-        // Get the image hash from the config
-        let image_hash = config
-            .image_hash()
-            .ok_or_else(|| {
-                Error::ImageBuildError("Image hash not found in config object.".to_string())
-            })?
-            .to_string();
-
-        // Build the reference from the image name
-        let image_uri = Image::image_reference(&image_name)
-            .map_err(|err| Error::ImageBuildError(format!("{:?}", err)))?;
-
-        Ok(Self {
-            name: image_name.as_ref().to_string(),
-            hash: image_hash,
-            uri: image_uri,
-            layers,
-            manifest,
-            config,
-        })
-    }
-
-    /// Returns the image name
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Returns the image hash
-    pub fn hash(&self) -> &str {
-        &self.hash
-    }
-
-    /// Returns the image URI (image reference)
-    pub fn uri(&self) -> &oci_distribution::Reference {
-        &self.uri
     }
 
     /// Builds a docker image reference from the image name given as parameter.
     ///
-    /// e.g. "hello-world" image has reference "docker.io/library/hello-world:latest"
-    pub fn image_reference<S: AsRef<str>>(image_name: S) -> Result<oci_distribution::Reference> {
+    /// e.g. "hello-world" image has reference "docker.io/library/hello-world:latest".
+    pub fn image_reference<S: AsRef<str>>(image_name: S) -> Result<Reference, Error> {
         let image_ref = image_name
             .as_ref()
             .parse()
-            .map_err(|err| Error::ImageRefError(err))?;
+            .map_err(Error::ImageRef)?;
 
         Ok(image_ref)
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-/// The image manifest describes a configuration and set of layers for a single
-/// container image for a specific architecture and operating system.
-pub struct ImageManifest {
-    schema_version: u32,
-    media_type: Option<String>,
+impl TryFrom<ImageData> for Image {
+    type Error = self::Error;
 
-    /// A reference to the image config
-    config: Descriptor,
+    /// Try to build an Image struct from an oci_distribution ImageData struct.
+    fn try_from(image_data: ImageData) -> Result<Self, Self::Error> {
+        let image_hash = extract::extract_image_hash(&image_data)?;
 
-    /// Array describing the image layers
-    layers: Vec<Descriptor>,
-    annotations: Option<HashMap<String, String>>,
-}
+        // Extract the layers as arrays of bytes
+        let layers = extract::extract_layers(&image_data)?;
+        let layers_data: Vec<Vec<u8>> = layers
+            .into_iter()
+            .map(|layer| layer.data)
+            .collect();
 
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-/// The image configuration data, containing metadata of an image such as date created, author,
-/// architecture, as well as runtime data such as bash commands and default arguments.
-pub struct ImageConfig {
-    created: Option<String>,
+        // Extract the manifest and config from the pulled struct as JSON Strings
+        let config_json = extract::extract_config_json(&image_data)?;
+        let manifest_json = extract::extract_manifest_json(&image_data)?;
 
-    author: Option<String>,
+        // Try to deserialize the JSON Strings into the oci_spec structs
 
-    architecture: Option<String>,
-
-    os: Option<String>,
-
-    #[serde(rename = "os.version")]
-    os_version: Option<String>,
-
-    #[serde(rename = "os.features")]
-    os_features: Option<Vec<String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config: Option<Config>,
-
-    /// Same structure as 'config' field, but usually this contains more detailed data
-    #[serde(skip_serializing_if = "Option::is_none")]
-    container_config: Option<Config>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    variant: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rootfs: Option<RootFs>,
-
-    history: Vec<LayerHistory>,
-}
-
-impl ImageConfig {
-    /// Returns the image hash
-    pub fn image_hash(&self) -> Option<&str> {
-        match &self.config {
-            Some(config) => config.image_hash(),
-            None => None,
-        }
+        Ok(Self{
+            hash: image_hash,
+            layers: Some(layers_data),
+            manifest: deserialize_from_reader(manifest_json.as_bytes())?,
+            config: deserialize_from_reader(config_json.as_bytes())?
+        })
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "PascalCase")]
-/// The execution parameters which should be used when running a container from
-/// the image.
-pub struct Config {
-    #[serde(rename = "Hostname")]
-    host_name: Option<String>,
-
-    #[serde(rename = "Domainname")]
-    domain_name: Option<String>,
-
-    attach_stdin: Option<bool>,
-    attach_stdout: Option<bool>,
-    attach_stderr: Option<bool>,
-    tty: Option<bool>,
-    open_stdin: Option<bool>,
-    stdin_once: Option<bool>,
-
-    user: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exposed_ports: Option<Vec<String>>,
-
-    image: Option<String>,
-
-    env: Option<Vec<String>>,
-    entrypoint: Option<Vec<String>>,
-    cmd: Option<Vec<String>>,
-    volumes: Option<Vec<String>>,
-    working_dir: Option<String>,
-    on_build: Option<Vec<String>>,
-    labels: Option<HashMap<String, String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_signal: Option<String>,
-}
-
-impl Config {
-    /// Returns the image hash.
-    pub fn image_hash(&self) -> Option<&str> {
-        match &self.image {
-            Some(hash_with_prefix) =>
-                // By default, the image hash is represented as "<hash_alg>:<hash_string>", so
-                // remove the <hash_alg> prefix to get the actual hash. The hash algorithm
-                // used is assumed to be sha256.
-                match hash_with_prefix.strip_prefix("sha256:") {
-                    Some(hash) => Some(hash),
-                    None => None
-                },
-            None => None
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-/// References the layer content addresses used by the image.
-pub struct RootFs {
-    #[serde(rename = "type")]
-    type_field: String,
-
-    /// An array of layer content digest hashes.
-    diff_ids: Vec<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-/// Describes the history and metadata of a layer.
-pub struct LayerHistory {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    author: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created_by: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    comment: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    empty_layer: Option<bool>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-/// A Descriptor provides information about a specific content. It includes the type of the content,
-/// a content identifier (digest), and the raw byte-size of the content.
-pub struct Descriptor {
-    #[serde(rename = "mediaType")]
-    media_type: String,
-    digest: String,
-    size: i64,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    urls: Option<Vec<String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    annotations: Option<HashMap<String, String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    platform: Option<Platform>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-/// Describes the minimum runtime requirements of the image.
-pub struct Platform {
-    architecture: String,
-    os: String,
-
-    #[serde(rename = "os.version")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    os_version: Option<String>,
-
-    #[serde(rename = "os.features")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    os_features: Option<Vec<String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    variant: Option<String>,
-}
-
+/// This is a copy of shiplift ImageDetails struct, used only for serialization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ShipliftImageDetails {
-    pub architecture: String,
-    pub author: String,
-    pub comment: String,
-    pub config: ShipliftConfig,
-    pub created: String,
-    pub docker_version: String,
-    pub id: String,
-    pub os: String,
-    pub parent: String,
+pub struct ModelImageDetails {
+    pub architecture: Option<String>,
+    pub author: Option<String>,
+    pub comment: Option<String>,
+    pub config: Option<ModelConfig>,
+    pub created: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_version: Option<String>,
+    pub id: Option<String>,
+    pub os: Option<String>,
+    pub parent: Option<String>,
     pub repo_tags: Option<Vec<String>>,
     pub repo_digests: Option<Vec<String>>,
-    pub size: u64,
-    pub virtual_size: u64,
+    pub size: Option<u64>,
+    pub virtual_size: Option<u64>,
 }
 
+/// This is a copy of shiplift Config struct, used only for serialization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ShipliftConfig {
-    pub attach_stderr: bool,
-    pub attach_stdin: bool,
-    pub attach_stdout: bool,
+pub struct ModelConfig {
+    pub attach_stderr: Option<bool>,
+    pub attach_stdin: Option<bool>,
+    pub attach_stdout: Option<bool>,
     pub cmd: Option<Vec<String>>,
-    pub domainname: String,
+    pub domainname: Option<String>,
     pub entrypoint: Option<Vec<String>>,
     pub env: Option<Vec<String>>,
     pub exposed_ports: Option<HashMap<String, HashMap<String, String>>>,
-    pub hostname: String,
-    pub image: String,
+    pub hostname: Option<String>,
+    pub image: Option<String>,
     pub labels: Option<HashMap<String, String>>,
     pub on_build: Option<Vec<String>>,
-    pub open_stdin: bool,
-    pub stdin_once: bool,
-    pub tty: bool,
-    pub user: String,
-    pub working_dir: String,
+    pub open_stdin: Option<bool>,
+    pub stdin_once: Option<bool>,
+    pub tty: Option<bool>,
+    pub user: Option<String>,
+    pub working_dir: Option<String>,
+}
+
+pub fn deserialize_from_file<P: AsRef<Path>, T: DeserializeOwned>(path: P) -> Result<T, Error> {
+    let path = path.as_ref();
+    let file =
+        BufReader::new(File::open(path)?);
+    let deserialized_obj = serde_json::from_reader(file)?;
+
+    Ok(deserialized_obj)
+}
+
+pub fn deserialize_from_reader<R: Read, T: DeserializeOwned>(reader: R) -> Result<T, serde_json::Error> {
+    let deserialized_obj = serde_json::from_reader(reader)?;
+
+    Ok(deserialized_obj)
+}
+
+pub fn serialize_to_file<P: AsRef<Path>, T: Serialize>(
+    path: P,
+    object: &T,
+    pretty: bool,
+) -> Result<(), Error> {
+    let path = path.as_ref();
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    let file = BufWriter::new(file);
+
+    match pretty {
+        true => serde_json::to_writer_pretty(file, object)?,
+        false => serde_json::to_writer(file, object)?,
+    };
+
+    Ok(())
+}
+
+pub fn serialize_to_writer<W: Write, T: Serialize>(
+    writer: &mut W,
+    object: &T,
+    pretty: bool,
+) -> Result<(), serde_json::Error> {
+    match pretty {
+        true => {
+            serde_json::to_writer_pretty(writer, object)?
+        }
+        false => serde_json::to_writer(writer, object)?,
+    };
+
+    Ok(())
+}
+
+pub fn serialize_to_string<T: Serialize>(object: &T, pretty: bool) -> Result<String, serde_json::Error> {
+    Ok(match pretty {
+        true => serde_json::to_string_pretty(object)?,
+        false => serde_json::to_string(object)?,
+    })
 }
