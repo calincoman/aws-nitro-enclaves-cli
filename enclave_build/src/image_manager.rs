@@ -169,8 +169,15 @@ impl ImageManager {
         }
 
         // Deserialize the config JSON String
-        let config: ModelImageDetails = serde_json::from_str(&config_json.as_str())
+        let mut config: ModelImageDetails = serde_json::from_str(&config_json.as_str())
             .map_err(|_| Error::Other("Could not serialize the config JSON.".to_string()))?; 
+
+        // The 'Id' field represents the hash of the image and is later used, so set this field in particular
+        // The image hash is the SHA256 digest of the image config, as specified in the OCI image-spec
+        // https://github.com/opencontainers/image-spec/blob/main/config.md
+    
+        let image_hash = format!("{:x}", sha2::Sha256::digest(config_json.as_bytes()));
+        config.id = Some(image_hash);
 
         Ok(json!(config))
     }
