@@ -6,13 +6,12 @@ use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 
-mod docker;
-mod yaml_generator;
 mod cache;
-mod extract;
+mod docker;
 mod image;
-mod pull;
 mod image_manager;
+mod pull;
+mod yaml_generator;
 
 use aws_nitro_enclaves_image_format::defs::{EifBuildInfo, EifIdentityInfo, EIF_HDR_ARCH_ARM64};
 use aws_nitro_enclaves_image_format::utils::identity::parse_custom_metadata;

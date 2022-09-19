@@ -9,12 +9,11 @@ use oci_distribution::{
     secrets::RegistryAuth,
 };
 
-use crate::{image::Image};
+use crate::image;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     ImageError(String),
-    ManifestDigestError(String),
     DockerConfigFileError(String),
     CredentialsError(String),
 }
@@ -24,9 +23,6 @@ impl std::fmt::Display for Error {
         match self {
             Error::ImageError(msg) => {
                 write!(f, "Could not pull image data from remote registry: {}", msg)
-            }
-            Error::ManifestDigestError(msg) => {
-                write!(f, "Failed to pull image manifest digest: {}", msg)
             }
             Error::DockerConfigFileError(msg) => write!(f, "{}", msg),
             Error::CredentialsError(msg) => write!(f, "{}", msg),
@@ -40,7 +36,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub const ACCEPTED_MEDIA_TYPES: [&'static str; 2] = [
     oci_distribution::manifest::WASM_LAYER_MEDIA_TYPE,
-    oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE
+    oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
 ];
 
 /// Builds a client which uses the protocol given as parameter.
@@ -107,9 +103,8 @@ fn get_docker_config_file() -> Result<File> {
 pub fn parse_credentials() -> Result<RegistryAuth> {
     let config_file = get_docker_config_file()?;
 
-    let config_json: serde_json::Value = serde_json::from_reader(&config_file).map_err(|err| {
-        Error::CredentialsError(format!("JSON was not well-formatted: {}", err))
-    })?;
+    let config_json: serde_json::Value = serde_json::from_reader(&config_file)
+        .map_err(|err| Error::CredentialsError(format!("JSON was not well-formatted: {}", err)))?;
 
     let auths = config_json.get("auths").ok_or_else(|| {
         Error::CredentialsError("Could not find auths key in config JSON".to_string())
@@ -120,9 +115,7 @@ pub fn parse_credentials() -> Result<RegistryAuth> {
             let auth = registry_auths
                 .get("auth")
                 .ok_or_else(|| {
-                    Error::CredentialsError(
-                        "Could not find auth key in config JSON".to_string(),
-                    )
+                    Error::CredentialsError("Could not find auth key in config JSON".to_string())
                 })?
                 .to_string();
 
@@ -169,14 +162,14 @@ pub fn docker_auth() -> RegistryAuth {
 }
 
 /// Pulls an image (all blobs - layers, manifest and config) from the Docker remote registry.
-/// 
+///
 /// The function takes as argument the image name (e.g. hello-world, postgres, ubuntu etc.)
 pub async fn pull_image_data<S: AsRef<str>>(image_name: S) -> Result<ImageData> {
     // Build the client required for the pulling - uses HTTPS protocol
     let mut client = build_client(ClientProtocol::Https);
 
     // Build an image reference from the image name
-    let image_ref = Image::image_reference(image_name)
+    let image_ref = image::image_reference(image_name)
         .map_err(|err| Error::ImageError(format!("{:?}", err)))?;
 
     // Try to get the credentials from the Docker config file for authentication
