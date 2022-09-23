@@ -10,7 +10,7 @@ use std::{
 
 use sha2::Digest;
 
-use crate::image::{self, ImageDetails, Layer};
+use crate::image::{self, ImageDetails};
 
 use oci_distribution::client::ImageData;
 
@@ -34,7 +34,6 @@ pub enum Error {
     HashMissing,
     FetchImageDetailsRef(crate::image::Error),
     FetchImageDetailsSerde(serde_json::Error),
-    FetchLayers(io::Error),
     FetchManifest(io::Error),
     FetchConfig(io::Error),
     /// Error when storing image data to cache
@@ -59,7 +58,6 @@ impl std::fmt::Display for Error {
             Error::FetchImageDetailsSerde(err) => {
                 write!(f, "Serialization/Deserialization error: {:?}", err)
             }
-            Error::FetchLayers(err) => write!(f, "Failed to fetch layers from cache: {:?}", err),
             Error::FetchManifest(err) => {
                 write!(f, "Failed to fetch manifest from cache: {:?}", err)
             }
@@ -375,68 +373,6 @@ impl CacheManager {
         }
 
         Ok(config_json)
-    }
-
-    // Unused right now, might be used in the future
-    /// Fetches the layer files from the cache.
-    fn fetch_layers<S: AsRef<str>>(&self, image_name: S) -> Result<Vec<Layer>> {
-        let target_path = self.get_image_folder_path(&image_name)?;
-
-        // Get all layer files from the folder
-        let mut layers_tmp = fs::read_dir(
-            // Create the path to the layers folder
-            target_path.join(CACHE_LAYERS_FOLDER_NAME),
-        )
-        .map_err(Error::FetchLayers)?
-        .into_iter()
-        .filter(|entry| entry.is_ok())
-        // Gen only the files
-        .filter(|entry| entry.as_ref().unwrap().path().is_file())
-        // Additional check to verify that it is indeed a layer
-        // The layer files are named after their hash
-        .filter(|file| file.as_ref().unwrap().file_name().len() == 64 as usize)
-        // Open each file
-        .map(move |file| {
-            let res = File::open(file.as_ref().unwrap().path());
-            if res.is_err() {
-                res.map_err(Error::FetchLayers)
-            } else {
-                Ok(res.unwrap())
-            }
-        });
-
-        // If not all layer files could be opened, return error
-        if layers_tmp.any(|res| res.is_err()) {
-            return Err(Error::FetchLayers(io::Error::new(
-                io::ErrorKind::Other,
-                "Not all layer
-                files could be opened",
-            )));
-        }
-
-        // If the if statement from above was not entered, then we can unwrap all
-        let layer_files = layers_tmp.into_iter().map(|file| file.unwrap());
-
-        let mut layers = Vec::new();
-
-        // Iterate through the layer files
-        for mut layer in layer_files {
-            let mut data = Vec::new();
-            let bytes_read = layer.read_to_end(&mut data).map_err(Error::FetchLayers)?;
-
-            // If no bytes were read, throw an error
-            if bytes_read == 0 {
-                return Err(Error::FetchLayers(io::Error::new(
-                    io::ErrorKind::Other,
-                    "No bytes read from layer.",
-                )));
-            }
-
-            // Add this layer to the array of layers
-            layers.push(Layer::new(data));
-        }
-
-        Ok(layers)
     }
 
     /// Validates that the image layers are cached correctly by checking them with the layer descriptors

@@ -100,19 +100,6 @@ impl ImageDetails {
     }
 }
 
-/// Wrapper for representing an image layer.
-pub struct Layer {
-    pub data: Vec<u8>,
-}
-
-impl Layer {
-    pub fn new(layer_bytes: Vec<u8>) -> Self {
-        Layer {
-            data: layer_bytes.clone(),
-        }
-    }
-}
-
 /// Calculates the image ID (or image hash) as the SHA256 digest of the image config.
 ///
 /// This method is described in the OCI image spec.

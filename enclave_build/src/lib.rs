@@ -16,7 +16,6 @@ mod yaml_generator;
 use aws_nitro_enclaves_image_format::defs::{EifBuildInfo, EifIdentityInfo, EIF_HDR_ARCH_ARM64};
 use aws_nitro_enclaves_image_format::utils::identity::parse_custom_metadata;
 use aws_nitro_enclaves_image_format::utils::{EifBuilder, SignEnclaveInfo};
-use docker::DockerUtil;
 use serde_json::json;
 use sha2::Digest;
 use std::collections::BTreeMap;
@@ -26,7 +25,8 @@ pub const DEFAULT_TAG: &str = "1.0";
 
 pub struct Docker2Eif<'a> {
     docker_image: String,
-    docker: DockerUtil,
+    // This field can be any struct that implements the 'ImageManager' trait
+    image_manager: Box<dyn image_manager::ImageManager>,
     init_path: String,
     nsm_path: String,
     kernel_img_path: String,
@@ -62,8 +62,15 @@ pub enum Docker2EifError {
 }
 
 impl<'a> Docker2Eif<'a> {
+    /// If the 'docker_dir' argument is Some (i.e. --docker-dir flag is used), the docker daemon will
+    /// always be used to build the image locally and store it in the docker cache.
+    /// 
+    /// If the 'oci_image' argument is Some (i.e. the --image-uri flag is used) and the '--docker-dir'
+    /// flag is not used, pull and cache the image without using the docker daemon.
     pub fn new(
         docker_image: String,
+        docker_dir: Option<String>,
+        oci_image: Option<String>,
         init_path: String,
         nsm_path: String,
         kernel_img_path: String,
@@ -78,7 +85,16 @@ impl<'a> Docker2Eif<'a> {
         metadata_path: Option<String>,
         build_info: EifBuildInfo,
     ) -> Result<Self, Docker2EifError> {
-        let docker = DockerUtil::new(docker_image.clone());
+        
+        let use_docker_daemon = match (&docker_dir, &oci_image) {
+            // If a Dockerfile dir is specified, then use the daemon to build the image locally even
+            // if the --image-uri flag is used.
+            (Some(_), Some(_)) => true,
+            // If a Dockerfile dir is not specified and the --image-uri flag is used, do not use docker.
+            (None, Some(_)) => false,
+            // For all other cases in which the --image-uri flag is not specified, use the daemon.
+            _ => true
+        };
 
         if !Path::new(&init_path).is_file() {
             return Err(Docker2EifError::InitPathError);
@@ -108,8 +124,11 @@ impl<'a> Docker2Eif<'a> {
         };
 
         Ok(Docker2Eif {
-            docker_image,
-            docker,
+            docker_image: docker_image.clone(),
+            image_manager: match use_docker_daemon {
+                true => Box::new(crate::docker::DockerImageManager::new(&docker_image)),
+                false => Box::new(crate::image_manager::OciImageManager::new(&oci_image.unwrap()))
+            },
             init_path,
             nsm_path,
             kernel_img_path,
@@ -125,8 +144,8 @@ impl<'a> Docker2Eif<'a> {
         })
     }
 
-    pub fn pull_docker_image(&mut self) -> Result<(), Docker2EifError> {
-        self.docker.pull_image().map_err(|e| {
+    pub fn pull_image(&mut self) -> Result<(), Docker2EifError> {
+        self.image_manager.pull_image().map_err(|e| {
             eprintln!("Docker error: {:?}", e);
             Docker2EifError::DockerError
         })?;
@@ -138,7 +157,7 @@ impl<'a> Docker2Eif<'a> {
         if !Path::new(&dockerfile_dir).is_dir() {
             return Err(Docker2EifError::DockerfilePathError);
         }
-        self.docker.build_image(dockerfile_dir).map_err(|e| {
+        self.image_manager.build_image(dockerfile_dir).map_err(|e| {
             eprintln!("Docker error: {:?}", e);
             Docker2EifError::DockerError
         })?;
@@ -147,7 +166,7 @@ impl<'a> Docker2Eif<'a> {
     }
 
     fn generate_identity_info(&mut self) -> Result<EifIdentityInfo, Docker2EifError> {
-        let docker_info = self.docker.inspect_image().map_err(|e| {
+        let docker_info = self.image_manager.inspect_image().map_err(|e| {
             Docker2EifError::MetadataError(format!("Docker inspect error: {:?}", e))
         })?;
 
@@ -196,7 +215,7 @@ impl<'a> Docker2Eif<'a> {
     }
 
     pub fn create(&mut self) -> Result<BTreeMap<String, String>, Docker2EifError> {
-        let (cmd_file, env_file) = self.docker.load().map_err(|e| {
+        let (cmd_file, env_file) = self.image_manager.load().map_err(|e| {
             eprintln!("Docker error: {:?}", e);
             Docker2EifError::DockerError
         })?;
@@ -263,7 +282,7 @@ impl<'a> Docker2Eif<'a> {
             return Err(Docker2EifError::LinuxkitExecError);
         }
 
-        let arch = self.docker.architecture().map_err(|e| {
+        let arch = self.image_manager.architecture().map_err(|e| {
             eprintln!("Docker error: {:?}", e);
             Docker2EifError::DockerError
         })?;

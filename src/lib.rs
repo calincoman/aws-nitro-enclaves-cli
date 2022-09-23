@@ -55,6 +55,8 @@ pub fn build_enclaves(args: BuildEnclavesArgs) -> NitroCliResult<()> {
     build_from_docker(
         &args.docker_uri,
         &args.docker_dir,
+        // This argument corresponds to the --image-uri flag
+        &args.oci_uri,
         &args.output,
         &args.signing_certificate,
         &args.private_key,
@@ -70,6 +72,7 @@ pub fn build_enclaves(args: BuildEnclavesArgs) -> NitroCliResult<()> {
 pub fn build_from_docker(
     docker_uri: &str,
     docker_dir: &Option<String>,
+    oci_uri: &Option<&str>,
     output_path: &str,
     signing_certificate: &Option<String>,
     private_key: &Option<String>,
@@ -127,6 +130,8 @@ pub fn build_from_docker(
 
     let mut docker2eif = enclave_build::Docker2Eif::new(
         docker_uri.to_string(),
+        docker_dir.clone(),
+        oci_uri.clone(),
         format!("{}/init", blobs_path),
         format!("{}/nsm.ko", blobs_path),
         kernel_path,
@@ -158,7 +163,7 @@ pub fn build_from_docker(
                 )
             })?;
     } else {
-        docker2eif.pull_docker_image().map_err(|err| {
+        docker2eif.pull_image().map_err(|err| {
             new_nitro_cli_failure!(
                 &format!("Failed to pull docker image: {:?}", err),
                 NitroCliErrorEnum::DockerImagePullError
