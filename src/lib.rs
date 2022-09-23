@@ -72,7 +72,7 @@ pub fn build_enclaves(args: BuildEnclavesArgs) -> NitroCliResult<()> {
 pub fn build_from_docker(
     docker_uri: &str,
     docker_dir: &Option<String>,
-    oci_uri: &Option<&str>,
+    oci_uri: &Option<String>,
     output_path: &str,
     signing_certificate: &Option<String>,
     private_key: &Option<String>,
@@ -723,6 +723,12 @@ macro_rules! create_app {
                         Arg::with_name("docker-dir")
                             .long("docker-dir")
                             .help("Local path to a directory containing a Dockerfile")
+                            .takes_value(true),
+                    )
+                    .arg(
+                        Arg::with_name("oci-uri")
+                            .long("oci-uri")
+                            .help("URI of an OCI image to pe pulled and cached without using the Docker daemon")
                             .takes_value(true),
                     )
                     .arg(
